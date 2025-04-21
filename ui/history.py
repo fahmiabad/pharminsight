@@ -2,7 +2,7 @@
 Search history page UI for PharmInsight.
 """
 import streamlit as st
-from ..qa.history import get_user_search_history, clear_search_history
+from qa.history import get_user_search_history, clear_search_history
 
 def history_page():
     """Render search history page"""
