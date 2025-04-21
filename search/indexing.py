@@ -7,7 +7,7 @@ import numpy as np
 import pickle
 import streamlit as st
 import sqlite3
-from ..config import INDEX_PATH, DOCS_METADATA_PATH, DB_PATH
+from config import INDEX_PATH, DOCS_METADATA_PATH, DB_PATH
 
 def rebuild_index_from_db():
     """
