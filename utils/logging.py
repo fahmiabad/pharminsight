@@ -4,7 +4,7 @@ Logging utilities for PharmInsight.
 import sqlite3
 import datetime
 import uuid
-from ..config import DB_PATH
+from config import DB_PATH
 
 def log_action(user_id, action, details=None):
     """
