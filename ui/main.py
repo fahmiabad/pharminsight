@@ -2,10 +2,10 @@
 Main search page UI for PharmInsight.
 """
 import streamlit as st
-from ..qa.generation import generate_answer
-from ..qa.feedback import feedback_ui
-from .common import display_source_documents
-from ..search.indexing import load_search_index
+from qa.generation import generate_answer
+from qa.feedback import feedback_ui
+from ui.common import display_source_documents
+from search.indexing import load_search_index
 
 def main_page():
     """Render the main search page"""
