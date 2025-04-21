@@ -413,13 +413,149 @@ def main_page():
             """)
 
 def profile_page():
-    """Render a simple profile page"""
-    st.title("Your Profile")
-    st.write(f"Username: {st.session_state['username']}")
-    st.write(f"Role: {st.session_state['role']}")
+    """Render the user profile page"""
+    st.header("Your Profile")
     
-    # This would show more profile information and settings in the full implementation
-    st.info("This is a simplified profile page. The full implementation would include more details and settings.")
+    try:
+        # Get user data
+        conn = sqlite3.connect(DB_PATH, timeout=20.0)
+        c = conn.cursor()
+        
+        c.execute("""
+        SELECT username, role, email, full_name, created_at, last_login
+        FROM users WHERE username = ?
+        """, (st.session_state["username"],))
+        
+        user_data = c.fetchone()
+        
+        if not user_data:
+            st.error("User data not found")
+            return
+            
+        username, role, email, full_name, created_at, last_login = user_data
+        
+        # Get user activity statistics
+        questions_df = pd.read_sql_query(
+            "SELECT COUNT(*) as count FROM qa_pairs WHERE user_id = ?",
+            conn, params=(username,)
+        )
+        question_count = questions_df['count'].iloc[0]
+        
+        feedback_df = pd.read_sql_query(
+            "SELECT COUNT(*) as count FROM feedback WHERE user_id = ?", 
+            conn, params=(username,)
+        )
+        feedback_count = feedback_df['count'].iloc[0]
+        
+        recent_searches = pd.read_sql_query(
+            """
+            SELECT query, timestamp 
+            FROM search_history 
+            WHERE user_id = ? 
+            ORDER BY timestamp DESC
+            LIMIT 5
+            """, 
+            conn, params=(username,)
+        )
+        
+        conn.close()
+        
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.subheader("Account Information")
+            st.write(f"**Username:** {username}")
+            st.write(f"**Role:** {role}")
+            st.write(f"**Email:** {email or 'Not set'}")
+            st.write(f"**Full Name:** {full_name or 'Not set'}")
+            st.write(f"**Account Created:** {created_at[:10] if created_at else 'Unknown'}")
+            st.write(f"**Last Login:** {last_login[:10] if last_login else 'First login'}")
+            
+            st.divider()
+            st.subheader("Update Profile")
+            
+            new_email = st.text_input("Email", value=email or "")
+            new_name = st.text_input("Full Name", value=full_name or "")
+            
+            if st.button("Update Profile"):
+                try:
+                    conn = sqlite3.connect(DB_PATH, timeout=20.0)
+                    c = conn.cursor()
+                    
+                    c.execute(
+                        "UPDATE users SET email = ?, full_name = ? WHERE username = ?",
+                        (new_email, new_name, username)
+                    )
+                    conn.commit()
+                    conn.close()
+                    
+                    log_action(username, "update_profile", "Updated user profile")
+                    st.success("Profile updated successfully")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error updating profile: {str(e)}")
+                
+            st.divider()
+            st.subheader("Change Password")
+            
+            current_pwd = st.text_input("Current Password", type="password")
+            new_pwd = st.text_input("New Password", type="password")
+            confirm_pwd = st.text_input("Confirm New Password", type="password")
+            
+            if st.button("Change Password"):
+                if not current_pwd or not new_pwd or not confirm_pwd:
+                    st.error("All password fields are required")
+                    return
+                    
+                if new_pwd != confirm_pwd:
+                    st.error("New passwords don't match")
+                    return
+                    
+                # Verify current password
+                calculated_hash = hashlib.sha256(f"{current_pwd}:salt_key".encode()).hexdigest()
+                
+                try:
+                    conn = sqlite3.connect(DB_PATH, timeout=20.0)
+                    c = conn.cursor()
+                    
+                    c.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+                    stored_hash = c.fetchone()[0]
+                    
+                    if stored_hash != calculated_hash:
+                        st.error("Current password is incorrect")
+                        conn.close()
+                        return
+                    
+                    # Update password
+                    new_hash = hashlib.sha256(f"{new_pwd}:salt_key".encode()).hexdigest()
+                    c.execute(
+                        "UPDATE users SET password_hash = ? WHERE username = ?",
+                        (new_hash, username)
+                    )
+                    conn.commit()
+                    conn.close()
+                    
+                    log_action(username, "change_password", "User changed their password")
+                    st.success("Password changed successfully")
+                except Exception as e:
+                    st.error(f"Error changing password: {str(e)}")
+        
+        with col2:
+            st.subheader("Your Activity")
+            
+            st.metric("Questions Asked", question_count)
+            st.metric("Feedback Given", feedback_count)
+            
+            st.subheader("Recent Searches")
+            if not recent_searches.empty:
+                for _, row in recent_searches.iterrows():
+                    formatted_time = row['timestamp'][:10] if row['timestamp'] else ""
+                    st.write(f"• {row['query']} ({formatted_time})")
+            else:
+                st.write("No recent searches")
+                
+    except Exception as e:
+        st.error(f"Error loading profile: {str(e)}")
 
 def history_page():
     """Render a simple history page"""
