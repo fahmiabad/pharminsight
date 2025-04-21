@@ -7,9 +7,9 @@ import hmac
 import datetime
 import uuid
 import streamlit as st
-from ..config import DB_PATH
-from ..utils.logging import log_action
-from ..database.setup import get_db_connection
+from config import DB_PATH
+from utils.logging import log_action
+from database.setup import get_db_connection
 
 def verify_password(username, password):
     """
