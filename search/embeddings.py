@@ -5,7 +5,7 @@ import streamlit as st
 import numpy as np
 from openai import OpenAI
 import os
-from ..config import DEFAULT_EMBEDDING_MODEL, get_openai_api_key
+from config import DEFAULT_EMBEDDING_MODEL, get_openai_api_key
 
 def get_openai_client():
     """
