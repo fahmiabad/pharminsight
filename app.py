@@ -32,7 +32,8 @@ def simple_login_form():
             st.session_state["username"] = username
             st.session_state["role"] = "admin"
             st.success(f"Login successful! Welcome back, {username}.")
-            st.experimental_rerun()
+            # Replace experimental_rerun with rerun
+            st.rerun()
         else:
             st.error("Invalid username or password")
 
@@ -45,7 +46,8 @@ def simple_main_page():
         st.session_state["authenticated"] = False
         st.session_state["username"] = None
         st.session_state["role"] = None
-        st.experimental_rerun()
+        # Replace experimental_rerun with rerun
+        st.rerun()
 
 # Page routing based on authentication state
 if not st.session_state["authenticated"]:
