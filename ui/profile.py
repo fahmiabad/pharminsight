@@ -3,8 +3,8 @@ User profile page UI for PharmInsight.
 """
 import streamlit as st
 import pandas as pd
-from ..auth.auth import get_user_profile, update_user_profile, change_password
-from ..config import DB_PATH
+from auth.auth import get_user_profile, update_user_profile, change_password
+from config import DB_PATH
 
 def profile_page():
     """Render the user profile page"""
