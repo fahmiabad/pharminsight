@@ -558,9 +558,128 @@ def profile_page():
         st.error(f"Error loading profile: {str(e)}")
 
 def history_page():
-    """Render a simple history page"""
-    st.title("Search History")
-    st.info("This is a simplified history page. The full implementation would show your search history.")
+    """Render search history page"""
+    st.title("Your Search History")
+    
+    try:
+        # Get search history
+        conn = sqlite3.connect(DB_PATH, timeout=20.0)
+        
+        history_df = pd.read_sql_query(
+            """
+            SELECT query, timestamp, num_results
+            FROM search_history
+            WHERE user_id = ?
+            ORDER BY timestamp DESC
+            LIMIT 50
+            """,
+            conn,
+            params=(st.session_state["username"],)
+        )
+        
+        # Get answered questions
+        qa_df = pd.read_sql_query(
+            """
+            SELECT question_id, query, timestamp
+            FROM qa_pairs
+            WHERE user_id = ?
+            ORDER BY timestamp DESC
+            LIMIT 50
+            """,
+            conn,
+            params=(st.session_state["username"],)
+        )
+        
+        conn.close()
+        
+        # Display history
+        tab1, tab2 = st.tabs(["🔍 Search History", "❓ Questions Asked"])
+        
+        with tab1:
+            if history_df.empty:
+                st.info("You haven't made any searches yet.")
+            else:
+                col1, col2 = st.columns([5, 1])
+                
+                with col1:
+                    st.write(f"Showing your last {len(history_df)} searches")
+                
+                with col2:
+                    if st.button("Clear History"):
+                        try:
+                            conn = sqlite3.connect(DB_PATH, timeout=20.0)
+                            c = conn.cursor()
+                            
+                            c.execute(
+                                "DELETE FROM search_history WHERE user_id = ?",
+                                (st.session_state["username"],)
+                            )
+                            
+                            conn.commit()
+                            conn.close()
+                            
+                            log_action(
+                                st.session_state["username"],
+                                "clear_history",
+                                "User cleared search history"
+                            )
+                            
+                            st.session_state["user_history"] = []
+                            st.success("Search history cleared")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error clearing history: {str(e)}")
+                
+                # Display history items
+                for i, row in history_df.iterrows():
+                    with st.container():
+                        col1, col2 = st.columns([4, 1])
+                        with col1:
+                            st.write(f"**{row['query']}**")
+                            # Format timestamp for display
+                            timestamp = row['timestamp']
+                            if timestamp:
+                                formatted_time = timestamp[:19].replace('T', ' ') if 'T' in timestamp else timestamp[:16]
+                                st.caption(f"{formatted_time}")
+                            # Show if search had results
+                            if 'num_results' in row and row['num_results'] > 0:
+                                st.caption(f"Found {row['num_results']} results")
+                            else:
+                                st.caption("No results found")
+                        with col2:
+                            if st.button("Search Again", key=f"again_{i}"):
+                                st.session_state["current_query"] = row['query']
+                                st.session_state["page"] = "main"
+                                st.rerun()
+                        st.divider()
+        
+        with tab2:
+            if qa_df.empty:
+                st.info("You haven't asked any questions yet.")
+            else:
+                st.write(f"Showing your last {len(qa_df)} questions")
+                
+                # Display questions
+                for i, row in qa_df.iterrows():
+                    with st.container():
+                        col1, col2 = st.columns([4, 1])
+                        with col1:
+                            st.write(f"**{row['query']}**")
+                            # Format timestamp for display
+                            timestamp = row['timestamp']
+                            if timestamp:
+                                formatted_time = timestamp[:19].replace('T', ' ') if 'T' in timestamp else timestamp[:16]
+                                st.caption(f"{formatted_time}")
+                        with col2:
+                            if st.button("View Answer", key=f"view_{i}"):
+                                # This would normally link to the answer, but for now just search again
+                                st.session_state["current_query"] = row['query']
+                                st.session_state["page"] = "main"
+                                st.rerun()
+                        st.divider()
+                
+    except Exception as e:
+        st.error(f"Error loading search history: {str(e)}")
 
 def admin_docs_page():
     """Admin document management page"""
@@ -985,34 +1104,714 @@ def admin_docs_page():
                     st.error(f"Error accessing database: {str(e)}")
 
 def admin_users_page():
-    """Render a simple user management page"""
+    """Admin user management page"""
     if not is_admin():
         st.warning("Admin access required")
         return
-    
+        
     st.title("User Management")
     
-    # Show basic user list
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=20.0)
-        users_df = pd.read_sql_query("SELECT username, role, email, full_name, created_at, last_login FROM users", conn)
-        conn.close()
-        
-        st.subheader("User Accounts")
-        st.dataframe(users_df)
-    except Exception as e:
-        st.error(f"Error loading users: {str(e)}")
+    # Create tabs for different functions
+    tab1, tab2, tab3 = st.tabs(["👥 Users List", "➕ Create User", "📊 User Activity"])
     
-    st.info("This is a simplified user management page. The full implementation would allow creating and managing users.")
+    try:
+        # Tab 1: Users List
+        with tab1:
+            st.subheader("All Users")
+            
+            # Get all users
+            conn = sqlite3.connect(DB_PATH, timeout=20.0)
+            users_df = pd.read_sql_query(
+                """
+                SELECT username, role, email, full_name, created_at, last_login 
+                FROM users
+                ORDER BY username
+                """, 
+                conn
+            )
+            
+            if users_df.empty:
+                st.info("No users found in the system.")
+            else:
+                # Format dates
+                if 'created_at' in users_df.columns:
+                    users_df['created_at'] = pd.to_datetime(users_df['created_at']).dt.strftime('%Y-%m-%d %H:%M')
+                
+                if 'last_login' in users_df.columns:
+                    users_df['last_login'] = pd.to_datetime(users_df['last_login']).dt.strftime('%Y-%m-%d %H:%M')
+                
+                # Display as a dataframe
+                st.dataframe(
+                    users_df,
+                    column_config={
+                        "username": st.column_config.TextColumn("Username"),
+                        "role": st.column_config.TextColumn("Role"),
+                        "email": st.column_config.TextColumn("Email"),
+                        "full_name": st.column_config.TextColumn("Full Name"),
+                        "created_at": st.column_config.TextColumn("Created"),
+                        "last_login": st.column_config.TextColumn("Last Login")
+                    },
+                    use_container_width=True
+                )
+                
+                # User details and actions
+                st.subheader("User Details")
+                selected_username = st.selectbox(
+                    "Select a user",
+                    users_df['username'].tolist()
+                )
+                
+                if selected_username:
+                    # Get user details
+                    user_row = users_df[users_df['username'] == selected_username].iloc[0]
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.write(f"**Username:** {user_row['username']}")
+                        st.write(f"**Role:** {user_row['role']}")
+                        st.write(f"**Email:** {user_row['email'] or 'Not set'}")
+                        
+                    with col2:
+                        st.write(f"**Full Name:** {user_row['full_name'] or 'Not set'}")
+                        st.write(f"**Created:** {user_row['created_at']}")
+                        st.write(f"**Last Login:** {user_row['last_login'] or 'Never'}")
+                    
+                    # User actions
+                    st.subheader("User Actions")
+                    
+                    action_col1, action_col2, action_col3 = st.columns(3)
+                    
+                    with action_col1:
+                        if st.button("Reset Password", disabled=(selected_username == st.session_state["username"])):
+                            st.session_state["show_reset_password"] = True
+                    
+                    with action_col2:
+                        if st.button("Change Role", disabled=(selected_username == st.session_state["username"])):
+                            st.session_state["show_change_role"] = True
+                            
+                    with action_col3:
+                        if st.button("Delete User", disabled=(selected_username == st.session_state["username"])):
+                            st.session_state["show_delete_user"] = True
+                    
+                    # Reset password form
+                    if st.session_state.get("show_reset_password", False):
+                        st.subheader("Reset Password")
+                        new_password = st.text_input("New Password", type="password")
+                        confirm_password = st.text_input("Confirm Password", type="password")
+                        
+                        if st.button("Submit Password Reset"):
+                            if not new_password or not confirm_password:
+                                st.error("Please enter both password fields")
+                            elif new_password != confirm_password:
+                                st.error("Passwords don't match")
+                            else:
+                                try:
+                                    # Hash new password
+                                    password_hash = hashlib.sha256(f"{new_password}:salt_key".encode()).hexdigest()
+                                    
+                                    # Update in database
+                                    conn = sqlite3.connect(DB_PATH, timeout=20.0)
+                                    c = conn.cursor()
+                                    c.execute(
+                                        "UPDATE users SET password_hash = ? WHERE username = ?",
+                                        (password_hash, selected_username)
+                                    )
+                                    conn.commit()
+                                    conn.close()
+                                    
+                                    log_action(
+                                        st.session_state["username"],
+                                        "reset_password",
+                                        f"Password reset for user: {selected_username}"
+                                    )
+                                    
+                                    st.success(f"Password for {selected_username} has been reset")
+                                    st.session_state["show_reset_password"] = False
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error resetting password: {str(e)}")
+                    
+                    # Change role form
+                    if st.session_state.get("show_change_role", False):
+                        st.subheader("Change User Role")
+                        new_role = st.selectbox(
+                            "New Role",
+                            ["user", "admin"],
+                            index=0 if user_row['role'] == "user" else 1
+                        )
+                        
+                        if st.button("Submit Role Change"):
+                            try:
+                                # Update role in database
+                                conn = sqlite3.connect(DB_PATH, timeout=20.0)
+                                c = conn.cursor()
+                                c.execute(
+                                    "UPDATE users SET role = ? WHERE username = ?",
+                                    (new_role, selected_username)
+                                )
+                                conn.commit()
+                                conn.close()
+                                
+                                log_action(
+                                    st.session_state["username"],
+                                    "change_role",
+                                    f"Changed role for user {selected_username} from {user_row['role']} to {new_role}"
+                                )
+                                
+                                st.success(f"Role for {selected_username} changed to {new_role}")
+                                st.session_state["show_change_role"] = False
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error changing role: {str(e)}")
+                    
+                    # Delete user form
+                    if st.session_state.get("show_delete_user", False):
+                        st.subheader("Delete User")
+                        st.warning(f"Are you sure you want to delete user '{selected_username}'? This action cannot be undone.")
+                        
+                        confirm = st.checkbox("I understand that this will permanently delete this user and all associated data")
+                        
+                        if st.button("Confirm Delete") and confirm:
+                            try:
+                                conn = sqlite3.connect(DB_PATH, timeout=20.0)
+                                c = conn.cursor()
+                                
+                                # Delete user's data from related tables
+                                c.execute("DELETE FROM search_history WHERE user_id = ?", (selected_username,))
+                                c.execute("DELETE FROM feedback WHERE user_id = ?", (selected_username,))
+                                c.execute("DELETE FROM qa_pairs WHERE user_id = ?", (selected_username,))
+                                
+                                # Finally delete the user
+                                c.execute("DELETE FROM users WHERE username = ?", (selected_username,))
+                                
+                                conn.commit()
+                                conn.close()
+                                
+                                log_action(
+                                    st.session_state["username"],
+                                    "delete_user",
+                                    f"Deleted user: {selected_username}"
+                                )
+                                
+                                st.success(f"User '{selected_username}' has been deleted")
+                                st.session_state["show_delete_user"] = False
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error deleting user: {str(e)}")
+                    
+                    # Get user activity
+                    st.subheader("User Activity")
+                    
+                    user_activity = pd.read_sql_query(
+                        """
+                        SELECT action, timestamp, details 
+                        FROM audit_log
+                        WHERE user_id = ?
+                        ORDER BY timestamp DESC
+                        LIMIT 10
+                        """,
+                        conn,
+                        params=(selected_username,)
+                    )
+                    
+                    if not user_activity.empty:
+                        user_activity['timestamp'] = pd.to_datetime(user_activity['timestamp']).dt.strftime('%Y-%m-%d %H:%M')
+                        
+                        st.dataframe(
+                            user_activity,
+                            column_config={
+                                "timestamp": st.column_config.TextColumn("Time"),
+                                "action": st.column_config.TextColumn("Action"),
+                                "details": st.column_config.TextColumn("Details")
+                            },
+                            use_container_width=True
+                        )
+                    else:
+                        st.info("No activity records found for this user")
+        
+        # Tab 2: Create User
+        with tab2:
+            st.subheader("Create New User")
+            
+            # User creation form
+            with st.form("create_user_form"):
+                username = st.text_input("Username")
+                password = st.text_input("Password", type="password")
+                confirm_password = st.text_input("Confirm Password", type="password")
+                
+                role = st.selectbox("Role", ["user", "admin"], index=0)
+                email = st.text_input("Email (optional)")
+                full_name = st.text_input("Full Name (optional)")
+                
+                submitted = st.form_submit_button("Create User")
+                
+                if submitted:
+                    if not username or not password or not confirm_password:
+                        st.error("Username and password are required")
+                    elif password != confirm_password:
+                        st.error("Passwords don't match")
+                    elif len(password) < 6:
+                        st.error("Password must be at least 6 characters long")
+                    else:
+                        try:
+                            # Check if username already exists
+                            conn = sqlite3.connect(DB_PATH, timeout=20.0)
+                            c = conn.cursor()
+                            
+                            c.execute("SELECT username FROM users WHERE username = ?", (username,))
+                            if c.fetchone():
+                                st.error("Username already exists")
+                                conn.close()
+                            else:
+                                # Create password hash
+                                password_hash = hashlib.sha256(f"{password}:salt_key".encode()).hexdigest()
+                                
+                                # Create user
+                                c.execute(
+                                    "INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                    (username, password_hash, role, email, full_name, 
+                                    datetime.datetime.now().isoformat(), None)
+                                )
+                                
+                                conn.commit()
+                                conn.close()
+                                
+                                log_action(
+                                    st.session_state["username"],
+                                    "create_user",
+                                    f"Created user: {username} with role: {role}"
+                                )
+                                
+                                st.success(f"User '{username}' created successfully")
+                        except Exception as e:
+                            st.error(f"Error creating user: {str(e)}")
+        
+        # Tab 3: User Activity
+        with tab3:
+            st.subheader("User Activity Overview")
+            
+            # Time period selection
+            time_period = st.selectbox(
+                "Time Period",
+                ["Last 7 days", "Last 30 days", "All time"],
+                index=1
+            )
+            
+            # Convert time period to SQL date filter
+            date_filters = {
+                "Last 7 days": "date('now', '-7 days')",
+                "Last 30 days": "date('now', '-30 days')",
+                "All time": "date('1970-01-01')"  # Unix epoch
+            }
+            
+            date_filter = date_filters[time_period]
+            
+            # Most active users
+            active_users = pd.read_sql_query(
+                f"""
+                SELECT 
+                    user_id,
+                    COUNT(*) as action_count
+                FROM audit_log
+                WHERE date(timestamp) > {date_filter}
+                GROUP BY user_id
+                ORDER BY action_count DESC
+                LIMIT 10
+                """,
+                conn
+            )
+            
+            # User logins
+            user_logins = pd.read_sql_query(
+                f"""
+                SELECT 
+                    user_id,
+                    COUNT(*) as login_count
+                FROM audit_log
+                WHERE action = 'login'
+                AND date(timestamp) > {date_filter}
+                GROUP BY user_id
+                ORDER BY login_count DESC
+                LIMIT 10
+                """,
+                conn
+            )
+            
+            # Action distribution
+            action_dist = pd.read_sql_query(
+                f"""
+                SELECT 
+                    action,
+                    COUNT(*) as count
+                FROM audit_log
+                WHERE date(timestamp) > {date_filter}
+                GROUP BY action
+                ORDER BY count DESC
+                """,
+                conn
+            )
+            
+            # Display visualizations
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.subheader("Most Active Users")
+                if not active_users.empty:
+                    st.bar_chart(active_users.set_index('user_id')['action_count'])
+                else:
+                    st.info("No user activity data for the selected period")
+                    
+            with col2:
+                st.subheader("Most Frequent Logins")
+                if not user_logins.empty:
+                    st.bar_chart(user_logins.set_index('user_id')['login_count'])
+                else:
+                    st.info("No login data for the selected period")
+            
+            # Action distribution
+            st.subheader("Action Distribution")
+            if not action_dist.empty:
+                st.bar_chart(action_dist.set_index('action')['count'])
+            else:
+                st.info("No action data for the selected period")
+            
+        conn.close()
+    except Exception as e:
+        st.error(f"Error in user management: {str(e)}")
 
 def admin_analytics_page():
-    """Render a simple analytics page"""
+    """Admin analytics dashboard page"""
     if not is_admin():
         st.warning("Admin access required")
         return
-    
+        
     st.title("Analytics Dashboard")
-    st.info("This is a simplified analytics page. The full implementation would show usage statistics and visualization.")
+    
+    # Create tabs for different analytics sections
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📊 Usage Statistics", 
+        "💬 Feedback Analysis",
+        "🔍 Search Patterns", 
+        "📑 Document Analytics"
+    ])
+    
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=20.0)
+        
+        # Tab 1: Usage Statistics
+        with tab1:
+            st.subheader("System Usage")
+            
+            # Get counts from different tables
+            query_counts = pd.read_sql_query(
+                """
+                SELECT 
+                    (SELECT COUNT(*) FROM users) as users_count,
+                    (SELECT COUNT(*) FROM documents) as documents_count,
+                    (SELECT COUNT(*) FROM chunks) as chunks_count,
+                    (SELECT COUNT(*) FROM qa_pairs) as qa_count,
+                    (SELECT COUNT(*) FROM search_history) as searches_count,
+                    (SELECT COUNT(*) FROM feedback) as feedback_count
+                """,
+                conn
+            )
+            
+            # Get recent activity
+            recent_activity = pd.read_sql_query(
+                """
+                SELECT action, user_id, timestamp, details
+                FROM audit_log
+                ORDER BY timestamp DESC
+                LIMIT 50
+                """,
+                conn
+            )
+            
+            # Get user activity over time
+            user_activity = pd.read_sql_query(
+                """
+                SELECT 
+                    date(timestamp) as date,
+                    COUNT(*) as count,
+                    action
+                FROM audit_log
+                GROUP BY date(timestamp), action
+                ORDER BY date
+                """,
+                conn
+            )
+            
+            # Display metrics in columns
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Total Users", query_counts['users_count'].iloc[0])
+                st.metric("Total Documents", query_counts['documents_count'].iloc[0])
+                
+            with col2:
+                st.metric("Document Chunks", query_counts['chunks_count'].iloc[0])
+                st.metric("Total Queries", query_counts['qa_count'].iloc[0])
+                
+            with col3:
+                st.metric("Search Count", query_counts['searches_count'].iloc[0])
+                st.metric("Feedback Collected", query_counts['feedback_count'].iloc[0])
+            
+            # Activity over time visualization
+            if not user_activity.empty:
+                st.subheader("Activity Over Time")
+                # Group actions into categories for better visualization
+                grouped_activity = user_activity.groupby('date')['count'].sum().reset_index()
+                
+                st.bar_chart(grouped_activity.set_index('date'))
+                
+            # Recent activity table
+            st.subheader("Recent Activity")
+            if not recent_activity.empty:
+                # Format timestamp
+                recent_activity['formatted_time'] = pd.to_datetime(recent_activity['timestamp']).dt.strftime('%Y-%m-%d %H:%M')
+                
+                st.dataframe(
+                    recent_activity[['formatted_time', 'user_id', 'action', 'details']],
+                    column_config={
+                        "formatted_time": st.column_config.TextColumn("Time"),
+                        "user_id": st.column_config.TextColumn("User"),
+                        "action": st.column_config.TextColumn("Action"),
+                        "details": st.column_config.TextColumn("Details")
+                    },
+                    use_container_width=True
+                )
+            else:
+                st.info("No recent activity recorded")
+        
+        # Tab 2: Feedback Analysis
+        with tab2:
+            st.subheader("Feedback Analysis")
+            
+            # Get feedback stats
+            stats_df = pd.read_sql_query(
+                """
+                SELECT 
+                    COUNT(*) as total_feedback,
+                    AVG(rating) as avg_rating
+                FROM feedback
+                """,
+                conn
+            )
+            
+            # Rating distribution
+            rating_dist = pd.read_sql_query(
+                """
+                SELECT rating, COUNT(*) as count
+                FROM feedback
+                GROUP BY rating
+                ORDER BY rating
+                """,
+                conn
+            )
+            
+            # Recent feedback
+            recent_feedback = pd.read_sql_query(
+                """
+                SELECT f.rating, f.comment, f.timestamp, q.query
+                FROM feedback f
+                JOIN qa_pairs q ON f.question_id = q.question_id
+                ORDER BY f.timestamp DESC
+                LIMIT 10
+                """,
+                conn
+            )
+            
+            if not stats_df.empty:
+                avg_rating = stats_df['avg_rating'].iloc[0]
+                total_feedback = stats_df['total_feedback'].iloc[0]
+                
+                st.metric("Average Rating", f"{avg_rating:.2f}/3.00" if avg_rating is not None else "No ratings")
+                st.metric("Total Feedback Collected", total_feedback)
+                
+                # Rating distribution visualization
+                if not rating_dist.empty:
+                    st.subheader("Rating Distribution")
+                    
+                    rating_labels = {
+                        1: "Not Helpful",
+                        2: "Somewhat Helpful",
+                        3: "Very Helpful"
+                    }
+                    
+                    # Add rating labels
+                    rating_dist['rating_label'] = rating_dist['rating'].map(rating_labels)
+                    
+                    # Create a horizontal bar chart
+                    st.bar_chart(rating_dist.set_index('rating_label')['count'])
+                    
+                # Recent feedback
+                st.subheader("Recent Feedback")
+                if not recent_feedback.empty:
+                    for _, row in recent_feedback.iterrows():
+                        with st.container():
+                            col1, col2 = st.columns([3, 1])
+                            
+                            rating_emoji = {
+                                1: "❌ Not Helpful",
+                                2: "⚠️ Somewhat Helpful",
+                                3: "✅ Very Helpful"
+                            }
+                            
+                            with col1:
+                                st.write(f"**Query:** {row['query']}")
+                                if row['comment']:
+                                    st.write(f"**Comment:** {row['comment']}")
+                            
+                            with col2:
+                                st.write(f"**Rating:** {rating_emoji.get(row['rating'], 'Unknown')}")
+                                st.caption(f"{row['timestamp'][:10] if row['timestamp'] else ''}")
+                            
+                            st.divider()
+                else:
+                    st.info("No feedback collected yet")
+            else:
+                st.info("No feedback data available")
+        
+        # Tab 3: Search Patterns
+        with tab3:
+            st.subheader("Search Patterns")
+            
+            # Get popular searches
+            popular_searches = pd.read_sql_query(
+                """
+                SELECT query, COUNT(*) as count
+                FROM search_history
+                GROUP BY query
+                ORDER BY count DESC
+                LIMIT 15
+                """,
+                conn
+            )
+            
+            # Get search success rate - assuming num_results > 0 means successful search
+            search_success = pd.read_sql_query(
+                """
+                SELECT 
+                    date(timestamp) as date,
+                    COUNT(*) as total_searches,
+                    SUM(CASE WHEN num_results > 0 THEN 1 ELSE 0 END) as successful_searches
+                FROM search_history
+                GROUP BY date(timestamp)
+                ORDER BY date
+                """,
+                conn
+            )
+            
+            # Query length analysis
+            query_length = pd.read_sql_query(
+                """
+                SELECT 
+                    length(query) as query_length,
+                    COUNT(*) as count
+                FROM search_history
+                GROUP BY length(query)
+                ORDER BY length(query)
+                """,
+                conn
+            )
+            
+            # Popular searches
+            st.subheader("Popular Searches")
+            if not popular_searches.empty:
+                # Create a horizontal bar chart for popular searches
+                popular_sorted = popular_searches.sort_values(by='count')
+                st.bar_chart(popular_sorted.set_index('query')['count'])
+            else:
+                st.info("No search data available")
+                
+            # Search success rate
+            if not search_success.empty and not search_success.empty.all():
+                st.subheader("Search Success Rate")
+                
+                # Calculate success rate
+                search_success['success_rate'] = (
+                    search_success['successful_searches'] / search_success['total_searches']
+                ) * 100
+                
+                # Line chart for success rate
+                st.line_chart(search_success.set_index('date')['success_rate'])
+                
+            # Query length distribution
+            if not query_length.empty:
+                st.subheader("Query Length Distribution")
+                st.bar_chart(query_length.set_index('query_length')['count'])
+        
+        # Tab 4: Document Analytics
+        with tab4:
+            st.subheader("Document Analytics")
+            
+            # Document categories
+            doc_categories = pd.read_sql_query(
+                """
+                SELECT 
+                    category,
+                    COUNT(*) as count
+                FROM documents
+                GROUP BY category
+                ORDER BY count DESC
+                """,
+                conn
+            )
+            
+            # Document upload timeline
+            doc_timeline = pd.read_sql_query(
+                """
+                SELECT 
+                    date(upload_date) as upload_date,
+                    COUNT(*) as count
+                FROM documents
+                GROUP BY date(upload_date)
+                ORDER BY upload_date
+                """,
+                conn
+            )
+            
+            # Document status counts
+            doc_status = pd.read_sql_query(
+                """
+                SELECT 
+                    is_active,
+                    COUNT(*) as count
+                FROM documents
+                GROUP BY is_active
+                """,
+                conn
+            )
+            
+            # Document categories
+            st.subheader("Document Categories")
+            if not doc_categories.empty:
+                st.bar_chart(doc_categories.set_index('category')['count'])
+            else:
+                st.info("No document category data available")
+                
+            # Document status
+            st.subheader("Document Status")
+            if not doc_status.empty:
+                # Add status labels
+                doc_status['status'] = doc_status['is_active'].map({
+                    0: "Inactive",
+                    1: "Active"
+                })
+                st.bar_chart(doc_status.set_index('status')['count'])
+            else:
+                st.info("No document status data available")
+                
+            # Document upload timeline
+            if not doc_timeline.empty:
+                st.subheader("Document Upload Timeline")
+                st.line_chart(doc_timeline.set_index('upload_date')['count'])
+            
+        conn.close()
+        
+    except Exception as e:
+        st.error(f"Error loading analytics data: {str(e)}")
 
 # Initialize the database
 init_database()
