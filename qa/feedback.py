@@ -6,8 +6,8 @@ import uuid
 import datetime
 import pandas as pd
 import streamlit as st
-from ..config import DB_PATH
-from ..utils.logging import log_action
+from config import DB_PATH
+from utils.logging import log_action
 
 def submit_feedback(question_id, rating, comment=None):
     """
