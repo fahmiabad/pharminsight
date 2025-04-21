@@ -6,10 +6,10 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import sqlite3
-from ...auth.auth import is_admin
-from ...config import DB_PATH
-from ...qa.feedback import get_feedback_stats
-from ...qa.history import get_popular_searches
+from auth.auth import is_admin
+from config import DB_PATH
+from qa.feedback import get_feedback_stats
+from qa.history import get_popular_searches
 
 def admin_analytics_page():
     """Admin analytics dashboard page"""
