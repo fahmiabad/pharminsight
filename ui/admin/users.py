@@ -4,9 +4,9 @@ User management admin page UI for PharmInsight.
 import streamlit as st
 import pandas as pd
 import sqlite3
-from ...auth.auth import is_admin, create_user
-from ...config import DB_PATH
-from ...database.operations import get_all_users
+from auth.auth import is_admin, create_user
+from config import DB_PATH
+from database.operations import get_all_users
 
 def admin_users_page():
     """Admin user management page"""
