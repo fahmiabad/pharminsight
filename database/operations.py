@@ -5,8 +5,8 @@ import sqlite3
 import datetime
 import pandas as pd
 from typing import List, Dict, Tuple, Optional, Any, Union
-from .setup import get_db_connection
-from ..config import DB_PATH
+from database.setup import get_db_connection
+from config import DB_PATH
 
 def execute_query(query: str, params: tuple = (), fetchone: bool = False):
     """
