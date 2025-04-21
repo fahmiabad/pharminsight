@@ -3,9 +3,9 @@ Search and retrieval functionality for PharmInsight.
 """
 import faiss
 import numpy as np
-from .embeddings import get_embedding
-from .indexing import load_search_index
-from ..config import SIMILARITY_THRESHOLD, K_RETRIEVE
+from search.embeddings import get_embedding
+from search.indexing import load_search_index
+from config import SIMILARITY_THRESHOLD, K_RETRIEVE
 
 def search_documents(query, k=K_RETRIEVE, threshold=SIMILARITY_THRESHOLD):
     """
