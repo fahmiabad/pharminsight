@@ -6,8 +6,8 @@ import uuid
 import datetime
 import pandas as pd
 import streamlit as st
-from ..config import DB_PATH
-from ..utils.logging import log_action
+from config import DB_PATH
+from utils.logging import log_action
 
 def record_search_history(query):
     """
