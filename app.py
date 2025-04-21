@@ -427,13 +427,426 @@ def history_page():
     st.info("This is a simplified history page. The full implementation would show your search history.")
 
 def admin_docs_page():
-    """Render a simple document management page"""
+    """Admin document management page"""
     if not is_admin():
         st.warning("Admin access required")
         return
-    
+        
     st.title("Document Management")
-    st.info("This is a simplified document management page. The full implementation would allow uploading and managing documents.")
+    
+    # Create tabs for different functions
+    tab1, tab2, tab3 = st.tabs(["📄 Documents List", "⬆️ Upload Documents", "🔄 Rebuild Index"])
+    
+    # Tab 1: Documents List
+    with tab1:
+        st.subheader("All Documents")
+        
+        # Get all documents
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=20.0)
+            docs_df = pd.read_sql_query(
+                """
+                SELECT d.doc_id, d.filename, d.category, d.upload_date, d.is_active,
+                       u.username as uploader, COUNT(c.chunk_id) as chunks
+                FROM documents d
+                JOIN users u ON d.uploader = u.username
+                LEFT JOIN chunks c ON d.doc_id = c.doc_id
+                GROUP BY d.doc_id
+                ORDER BY d.upload_date DESC
+                """,
+                conn
+            )
+            conn.close()
+            
+            if docs_df.empty:
+                st.info("No documents in the system yet.")
+            else:
+                # Format the status column
+                docs_df['status'] = docs_df['is_active'].apply(lambda x: "✅ Active" if x else "❌ Inactive")
+                
+                # Display as a dataframe with action buttons
+                st.dataframe(
+                    docs_df[['filename', 'category', 'upload_date', 'uploader', 'chunks', 'status']],
+                    column_config={
+                        "upload_date": st.column_config.DatetimeColumn(
+                            "Upload Date",
+                            format="YYYY-MM-DD HH:mm"
+                        )
+                    }
+                )
+                
+                # Document details and actions
+                st.subheader("Document Details")
+                
+                if not docs_df.empty:
+                    selected_doc_id = st.selectbox(
+                        "Select a document",
+                        docs_df['doc_id'].tolist(),
+                        format_func=lambda x: docs_df.loc[docs_df['doc_id'] == x, 'filename'].iloc[0]
+                    )
+                    
+                    if selected_doc_id:
+                        # Get document details
+                        conn = sqlite3.connect(DB_PATH, timeout=20.0)
+                        doc_df = pd.read_sql_query(
+                            """
+                            SELECT d.*, u.username as uploader_name
+                            FROM documents d
+                            JOIN users u ON d.uploader = u.username
+                            WHERE d.doc_id = ?
+                            """,
+                            conn,
+                            params=(selected_doc_id,)
+                        )
+                        
+                        # Get chunks
+                        chunks_df = pd.read_sql_query(
+                            "SELECT chunk_id, text FROM chunks WHERE doc_id = ?",
+                            conn,
+                            params=(selected_doc_id,)
+                        )
+                        
+                        conn.close()
+                        
+                        if not doc_df.empty:
+                            doc_info = doc_df.iloc[0].to_dict()
+                            
+                            col1, col2, col3 = st.columns(3)
+                            
+                            with col1:
+                                st.write(f"**Filename:** {doc_info['filename']}")
+                                st.write(f"**Category:** {doc_info['category']}")
+                                st.write(f"**Upload Date:** {doc_info['upload_date'][:10]}")
+                                
+                            with col2:
+                                st.write(f"**Uploaded by:** {doc_info['uploader_name']}")
+                                st.write(f"**Status:** {'Active' if doc_info['is_active'] else 'Inactive'}")
+                                st.write(f"**Chunks:** {len(chunks_df) if not chunks_df.empty else 0}")
+                                
+                            with col3:
+                                is_active = bool(doc_info['is_active'])
+                                if is_active:
+                                    if st.button("Deactivate Document"):
+                                        try:
+                                            conn = sqlite3.connect(DB_PATH, timeout=20.0)
+                                            c = conn.cursor()
+                                            c.execute(
+                                                "UPDATE documents SET is_active = ? WHERE doc_id = ?",
+                                                (0, selected_doc_id)
+                                            )
+                                            conn.commit()
+                                            conn.close()
+                                            
+                                            status_str = "deactivated"
+                                            log_action(
+                                                st.session_state["username"],
+                                                f"document_{status_str}",
+                                                f"Document {selected_doc_id} was {status_str}"
+                                            )
+                                            
+                                            st.success("Document deactivated")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Error deactivating document: {str(e)}")
+                                else:
+                                    if st.button("Activate Document"):
+                                        try:
+                                            conn = sqlite3.connect(DB_PATH, timeout=20.0)
+                                            c = conn.cursor()
+                                            c.execute(
+                                                "UPDATE documents SET is_active = ? WHERE doc_id = ?",
+                                                (1, selected_doc_id)
+                                            )
+                                            conn.commit()
+                                            conn.close()
+                                            
+                                            status_str = "activated"
+                                            log_action(
+                                                st.session_state["username"],
+                                                f"document_{status_str}",
+                                                f"Document {selected_doc_id} was {status_str}"
+                                            )
+                                            
+                                            st.success("Document activated")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Error activating document: {str(e)}")
+                                            
+                                if st.button("Delete Document", type="primary"):
+                                    confirm = st.checkbox("Confirm deletion?")
+                                    if confirm:
+                                        try:
+                                            conn = sqlite3.connect(DB_PATH, timeout=20.0)
+                                            c = conn.cursor()
+                                            
+                                            # Get filename first for logging
+                                            c.execute("SELECT filename FROM documents WHERE doc_id = ?", (selected_doc_id,))
+                                            result = c.fetchone()
+                                            filename = result[0] if result else "unknown"
+                                            
+                                            # Delete chunks first (foreign key constraint)
+                                            c.execute("DELETE FROM chunks WHERE doc_id = ?", (selected_doc_id,))
+                                            
+                                            # Delete the document
+                                            c.execute("DELETE FROM documents WHERE doc_id = ?", (selected_doc_id,))
+                                            
+                                            conn.commit()
+                                            conn.close()
+                                            
+                                            log_action(
+                                                st.session_state["username"],
+                                                "delete_document",
+                                                f"Deleted document: {filename}, ID: {selected_doc_id}"
+                                            )
+                                            
+                                            st.success("Document deleted successfully")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Error deleting document: {str(e)}")
+                            
+                            # Show document chunks
+                            if not chunks_df.empty:
+                                with st.expander("View Document Chunks"):
+                                    for i, row in chunks_df.iterrows():
+                                        st.markdown(f"**Chunk {i+1}**")
+                                        st.text_area(
+                                            f"Text for chunk {i+1}",
+                                            value=row['text'],
+                                            height=150,
+                                            key=f"chunk_{row['chunk_id']}",
+                                            disabled=True
+                                        )
+                                        st.divider()
+        except Exception as e:
+            st.error(f"Error processing documents: {str(e)}")
+    
+    # Tab 2: Upload Documents
+    with tab2:
+        st.subheader("Upload New Documents")
+        
+        uploaded_files = st.file_uploader(
+            "Upload documents (PDF or text files)", 
+            accept_multiple_files=True,
+            type=["pdf", "txt"]
+        )
+        
+        if uploaded_files:
+            # Meta-information for uploads
+            with st.expander("Document Information", expanded=True):
+                category = st.selectbox(
+                    "Document Category",
+                    ["Clinical Guidelines", "Drug Information", "Policy", "Protocol", "Research", "Educational", "Other"],
+                    index=0
+                )
+                
+                description = st.text_area("Description (optional)")
+                expiry_date = st.date_input("Expiry Date (if applicable)", value=None)
+                
+            # Processing options
+            with st.expander("Processing Options", expanded=True):
+                chunk_size = st.slider("Chunk Size (characters)", 500, 2000, 1000, 100)
+                chunk_overlap = st.slider("Chunk Overlap (characters)", 50, 500, 200, 50)
+                st.info("A smaller chunk size and larger overlap may improve search quality but increases processing time and storage requirements.")
+            
+            # Debug option for document processing
+            debug_mode = st.checkbox("Enable debug mode", value=True)
+            
+            # Process files
+            if st.button("Process and Upload", type="primary"):
+                metadata = {
+                    "category": category,
+                    "description": description,
+                    "expiry_date": expiry_date.isoformat() if expiry_date else None,
+                    "chunk_size": chunk_size,
+                    "chunk_overlap": chunk_overlap
+                }
+                
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                for i, file in enumerate(uploaded_files):
+                    status_text.text(f"Processing {file.name} ({i+1}/{len(uploaded_files)})")
+                    progress_bar.progress((i) / len(uploaded_files))
+                    
+                    if debug_mode:
+                        st.write(f"Processing file: {file.name}")
+                        st.write(f"File size: {file.size} bytes")
+                        st.write(f"File type: {file.type}")
+                        
+                        # Extract a sample of the file content
+                        if file.name.lower().endswith(".pdf"):
+                            with st.expander("File Preview"):
+                                st.write("PDF file detected. Attempting text extraction...")
+                                
+                                try:
+                                    from io import BytesIO
+                                    from PyPDF2 import PdfReader
+                                    
+                                    reader = PdfReader(file)
+                                    sample_text = ""
+                                    
+                                    # Extract first page as sample
+                                    if len(reader.pages) > 0:
+                                        sample_text = reader.pages[0].extract_text()
+                                    
+                                    file.seek(0)  # Reset file pointer
+                                    preview = sample_text[:500] + "..." if len(sample_text) > 500 else sample_text
+                                    st.text(preview)
+                                except Exception as e:
+                                    st.error(f"Error previewing PDF: {str(e)}")
+                    
+                    try:
+                        # Extract text from file
+                        text = ""
+                        if file.name.lower().endswith(".pdf"):
+                            try:
+                                from io import BytesIO
+                                from PyPDF2 import PdfReader
+                                
+                                reader = PdfReader(file)
+                                text = ""
+                                for page in reader.pages:
+                                    text += page.extract_text() + "\n\n"
+                                file.seek(0)
+                            except Exception as e:
+                                st.error(f"Error extracting PDF: {str(e)}")
+                                continue
+                        elif file.name.lower().endswith((".txt", ".csv", ".md")):
+                            try:
+                                text = file.read().decode("utf-8")
+                                file.seek(0)
+                            except UnicodeDecodeError:
+                                # Try other encodings
+                                file.seek(0)
+                                for encoding in ["latin-1", "windows-1252", "iso-8859-1"]:
+                                    try:
+                                        text = file.read().decode(encoding)
+                                        file.seek(0)
+                                        break
+                                    except:
+                                        file.seek(0)
+                                        continue
+                        else:
+                            st.error(f"Unsupported file type: {file.name}")
+                            continue
+                        
+                        if not text.strip():
+                            st.error(f"No content extracted from {file.name}")
+                            continue
+                        
+                        # Chunk the text
+                        chunks = []
+                        if len(text) < chunk_size:
+                            chunks = [text]
+                        else:
+                            start = 0
+                            text_len = len(text)
+                            
+                            while start < text_len:
+                                end = min(start + chunk_size, text_len)
+                                
+                                if end >= text_len:
+                                    chunks.append(text[start:])
+                                    break
+                                    
+                                # Find semantic boundaries
+                                last_paragraph = text.rfind('\n\n', start + chunk_size // 2, end)
+                                last_period = text.rfind('. ', start + chunk_size // 2, end)
+                                last_newline = text.rfind('\n', start + chunk_size // 2, end)
+                                
+                                # Choose the best break point
+                                if last_paragraph > start:
+                                    break_point = last_paragraph + 2
+                                elif last_period > start:
+                                    break_point = last_period + 1
+                                elif last_newline > start:
+                                    break_point = last_newline + 1
+                                else:
+                                    break_point = end
+                                    
+                                chunk = text[start:break_point].strip()
+                                if chunk:
+                                    chunks.append(chunk)
+                                
+                                start = break_point - chunk_overlap
+                                if start < 0:
+                                    start = 0
+                        
+                        # Store document in database
+                        conn = sqlite3.connect(DB_PATH, timeout=20.0)
+                        c = conn.cursor()
+                        
+                        # Create document record
+                        doc_id = str(uuid.uuid4())
+                        c.execute(
+                            "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                doc_id,
+                                file.name,
+                                datetime.datetime.now().isoformat(),
+                                st.session_state["username"],
+                                metadata.get("category", "Uncategorized"),
+                                metadata.get("description", ""),
+                                metadata.get("expiry_date", ""),
+                                1  # is_active
+                            )
+                        )
+                        
+                        # Store chunks
+                        for i, chunk_text in enumerate(chunks):
+                            if not chunk_text.strip():
+                                continue
+                                
+                            chunk_id = f"{doc_id}_{i+1}"
+                            
+                            # For now, we're not generating embeddings
+                            c.execute(
+                                "INSERT INTO chunks VALUES (?, ?, ?, ?)",
+                                (chunk_id, doc_id, chunk_text, None)
+                            )
+                        
+                        conn.commit()
+                        conn.close()
+                        
+                        log_action(
+                            st.session_state["username"],
+                            "upload_document",
+                            f"Uploaded document: {file.name}, ID: {doc_id}, Chunks: {len(chunks)}"
+                        )
+                        
+                        st.success(f"✅ {file.name}: Processed successfully with {len(chunks)} chunks")
+                    except Exception as e:
+                        st.error(f"❌ {file.name}: Error processing document: {str(e)}")
+                        
+                progress_bar.progress(1.0)
+                status_text.text("Processing complete")
+                
+                # Rebuild index placeholder
+                with st.spinner("Rebuilding search index..."):
+                    st.info("Search index rebuilding would happen here in the full implementation")
+                    
+    # Tab 3: Rebuild Index
+    with tab3:
+        st.subheader("Rebuild Search Index")
+        st.markdown("""
+        Rebuilding the search index will update the vector database used for document retrieval.
+        This is useful if documents were added, modified, or removed directly in the database.
+        """)
+        
+        if st.button("Rebuild Index", type="primary"):
+            with st.spinner("Rebuilding search index..."):
+                try:
+                    # Just count chunks for now
+                    conn = sqlite3.connect(DB_PATH, timeout=20.0)
+                    c = conn.cursor()
+                    c.execute("SELECT COUNT(*) FROM chunks")
+                    count = c.fetchone()[0]
+                    conn.close()
+                    
+                    st.success(f"Search index would be rebuilt with {count} document chunks")
+                    st.info("In the full implementation, this would generate embeddings and build a vector index")
+                except Exception as e:
+                    st.error(f"Error accessing database: {str(e)}")
 
 def admin_users_page():
     """Render a simple user management page"""
