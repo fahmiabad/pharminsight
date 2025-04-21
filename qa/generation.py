@@ -7,10 +7,10 @@ import datetime
 import json
 import streamlit as st
 from openai import OpenAI
-from ..config import DB_PATH, DEFAULT_LLM_MODEL, DEFAULT_TEMPERATURE
-from ..search.embeddings import get_openai_client
-from ..search.retrieval import search_documents
-from .history import record_search_history
+from config import DB_PATH, DEFAULT_LLM_MODEL, DEFAULT_TEMPERATURE
+from search.embeddings import get_openai_client
+from search.retrieval import search_documents
+from qa.history import record_search_history
 
 def generate_answer(query, model=DEFAULT_LLM_MODEL, include_explanation=True, temp=DEFAULT_TEMPERATURE):
     """
