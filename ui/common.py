@@ -2,8 +2,8 @@
 Common UI components for PharmInsight.
 """
 import streamlit as st
-from ..config import APP_VERSION
-from ..auth.auth import is_admin, logout_user
+from config import APP_VERSION
+from auth.auth import is_admin, logout_user
 
 def render_sidebar():
     """Render the application sidebar"""
