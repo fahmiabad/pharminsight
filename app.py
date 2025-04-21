@@ -1,76 +1,56 @@
+"""
+PharmInsight - A clinical knowledge base for pharmacists.
+
+This is the main entry point for the PharmInsight application.
+"""
 import streamlit as st
+import os
+import time
 
-st.title("Testing PharmInsight")
-st.write("This is a test to see if basic Streamlit functionality works")
+# Initialize session state variables
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+if "username" not in st.session_state:
+    st.session_state["username"] = None
+if "role" not in st.session_state:
+    st.session_state["role"] = None
+if "page" not in st.session_state:
+    st.session_state["page"] = "main"
 
-# Try to import each module one at a time
-try:
-    from config import APP_VERSION
-    st.success(f"Successfully imported config, version: {APP_VERSION}")
-except Exception as e:
-    st.error(f"Failed to import config: {str(e)}")
+# Basic login form to test functionality
+def simple_login_form():
+    st.header("Welcome to PharmInsight")
+    st.markdown("Please login to continue")
+    
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+    
+    if st.button("Login"):
+        # Hard-coded admin credentials for testing
+        if username == "admin" and password == "adminpass":
+            st.session_state["authenticated"] = True
+            st.session_state["username"] = username
+            st.session_state["role"] = "admin"
+            st.success(f"Login successful! Welcome back, {username}.")
+            st.experimental_rerun()
+        else:
+            st.error("Invalid username or password")
 
-try:
-    from database.setup import init_database
-    st.success("Successfully imported database.setup")
-    try:
-        init_database()
-        st.success("Successfully initialized database")
-    except Exception as e:
-        st.error(f"Failed to initialize database: {str(e)}")
-except Exception as e:
-    st.error(f"Failed to import database.setup: {str(e)}")
+# Simple main page
+def simple_main_page():
+    st.title("PharmInsight for Pharmacists")
+    st.write(f"Logged in as: {st.session_state['username']} ({st.session_state['role']})")
+    
+    if st.button("Logout"):
+        st.session_state["authenticated"] = False
+        st.session_state["username"] = None
+        st.session_state["role"] = None
+        st.experimental_rerun()
 
-# Test auth module
-try:
-    from auth.auth import is_admin
-    st.success("Successfully imported auth.auth")
-except Exception as e:
-    st.error(f"Failed to import auth.auth: {str(e)}")
-
-# Test UI modules
-try:
-    from ui.common import render_sidebar
-    st.success("Successfully imported ui.common")
-except Exception as e:
-    st.error(f"Failed to import ui.common: {str(e)}")
-
-try:
-    from ui.main import main_page
-    st.success("Successfully imported ui.main")
-except Exception as e:
-    st.error(f"Failed to import ui.main: {str(e)}")
-
-# Test document processing
-try:
-    from document_processing.management import list_documents
-    st.success("Successfully imported document_processing.management")
-except Exception as e:
-    st.error(f"Failed to import document_processing.management: {str(e)}")
-
-# Test search
-try:
-    from search.indexing import load_search_index
-    st.success("Successfully imported search.indexing")
-except Exception as e:
-    st.error(f"Failed to import search.indexing: {str(e)}")
-
-# Initialize session state variables for testing
-try:
-    from config import initialize_session_state
-    initialize_session_state()
-    st.success("Successfully initialized session state")
-except Exception as e:
-    st.error(f"Failed to initialize session state: {str(e)}")
-
-# Now try to render a simple UI element from one of your modules
-st.header("Testing UI Rendering")
-st.session_state["authenticated"] = True
-st.session_state["username"] = "test_user"
-st.session_state["role"] = "admin"
-
-try:
-    render_sidebar()
-    st.success("Successfully rendered sidebar")
-except Exception as e:
-    st.error(f"Failed to render sidebar: {str(e)}")
+# Page routing based on authentication state
+if not st.session_state["authenticated"]:
+    # Show login form
+    simple_login_form()
+else:
+    # Show main page
+    simple_main_page()
