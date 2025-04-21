@@ -2,15 +2,15 @@
 Document management admin page UI for PharmInsight.
 """
 import streamlit as st
-from ...auth.auth import is_admin
-from ...document_processing.management import (
+from auth.auth import is_admin
+from document_processing.management import (
     list_documents,
     get_document_details,
     toggle_document_status,
     delete_document,
     process_document
 )
-from ...search.indexing import rebuild_index_from_db
+from search.indexing import rebuild_index_from_db
 
 def admin_documents_page():
     """Admin document management page"""
