@@ -7,12 +7,12 @@ import datetime
 import pickle
 import pandas as pd
 import streamlit as st
-from ..config import DB_PATH
-from ..utils.logging import log_action
-from .extraction import extract_text_from_file
-from .chunking import chunk_text
-from ..search.embeddings import get_embedding
-from ..search.indexing import rebuild_index_from_db
+from config import DB_PATH
+from utils.logging import log_action
+from document_processing.extraction import extract_text_from_file
+from document_processing.chunking import chunk_text
+from search.embeddings import get_embedding
+from search.indexing import rebuild_index_from_db
 
 def process_document(file, metadata=None):
     """
