@@ -5,8 +5,8 @@ import sqlite3
 import datetime
 import hashlib
 import uuid
-from ..utils.logging import log_action
-from ..config import DB_PATH
+from utils.logging import log_action
+from config import DB_PATH
 
 def init_database():
     """Initialize all database tables"""
