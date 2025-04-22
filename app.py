@@ -1,8 +1,3 @@
-"""
-PharmInsight - A clinical knowledge base for pharmacists.
-
-This is the main entry point for the PharmInsight application.
-"""
 import os
 from openai import OpenAI
 import faiss
@@ -21,684 +16,980 @@ from io import BytesIO
 from PyPDF2 import PdfReader
 
 # Add the current directory to Python's path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Note: This might not work as expected in all deployment environments.
+# Consider using relative imports or proper package structure if issues arise.
+# sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Constants
 APP_VERSION = "2.1.0"
 DB_PATH = "pharminsight.db"
 INDEX_PATH = "vector.index"
 DOCS_METADATA_PATH = "docs_metadata.pkl"
-SIMILARITY_THRESHOLD = 0.75
-K_RETRIEVE = 5
+# SIMILARITY_THRESHOLD = 0.75 # Using session state value now
+# K_RETRIEVE = 5 # Using session state value now
 
-# Add these new functions for the full functionality
+# --- Database Initialization ---
+def init_database():
+    """Initialize all database tables"""
+    try:
+        # Use context manager for connection handling
+        with sqlite3.connect(DB_PATH, timeout=20.0) as conn:
+            c = conn.cursor()
 
+            # Users table
+            c.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('user', 'admin')),
+                email TEXT UNIQUE,
+                full_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP
+            )
+            ''')
+
+            # Documents table
+            c.execute('''
+            CREATE TABLE IF NOT EXISTS documents (
+                doc_id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                uploader TEXT NOT NULL,
+                category TEXT,
+                description TEXT,
+                expiry_date TEXT,
+                is_active INTEGER DEFAULT 1 CHECK(is_active IN (0, 1)),
+                FOREIGN KEY (uploader) REFERENCES users(username) ON DELETE SET NULL
+            )
+            ''')
+
+            # Document chunks table
+            c.execute('''
+            CREATE TABLE IF NOT EXISTS chunks (
+                chunk_id TEXT PRIMARY KEY,
+                doc_id TEXT NOT NULL,
+                text TEXT NOT NULL,
+                embedding BLOB, -- Store embedding if needed, but FAISS index is primary
+                FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+            )
+            ''')
+            # Add index for faster chunk retrieval by doc_id
+            c.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks (doc_id)")
+
+
+            # Questions and answers table
+            c.execute('''
+            CREATE TABLE IF NOT EXISTS qa_pairs (
+                question_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                query TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                sources TEXT, -- JSON list of source filenames or identifiers
+                model_used TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(username) ON DELETE CASCADE
+            )
+            ''')
+             # Add index for faster QA retrieval by user_id
+            c.execute("CREATE INDEX IF NOT EXISTS idx_qa_pairs_user_id ON qa_pairs (user_id)")
+
+
+            # Feedback table with 3-point rating scale
+            c.execute('''
+            CREATE TABLE IF NOT EXISTS feedback (
+                feedback_id TEXT PRIMARY KEY,
+                question_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 3),
+                comment TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (question_id) REFERENCES qa_pairs(question_id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(username) ON DELETE CASCADE
+            )
+            ''')
+            # Add index for faster feedback retrieval
+            c.execute("CREATE INDEX IF NOT EXISTS idx_feedback_question_id ON feedback (question_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_feedback_user_id ON feedback (user_id)")
+
+
+            # Audit log table
+            c.execute('''
+            CREATE TABLE IF NOT EXISTS audit_log (
+                log_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL, -- Can be 'system' for system actions
+                action TEXT NOT NULL,
+                details TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+             # Add index for faster audit log retrieval by user_id and timestamp
+            c.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_user_id ON audit_log (user_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log (timestamp)")
+
+
+            # User search history
+            c.execute('''
+            CREATE TABLE IF NOT EXISTS search_history (
+                history_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                query TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                num_results INTEGER,
+                FOREIGN KEY (user_id) REFERENCES users(username) ON DELETE CASCADE
+            )
+            ''')
+            # Add index for faster history retrieval by user_id and timestamp
+            c.execute("CREATE INDEX IF NOT EXISTS idx_search_history_user_id ON search_history (user_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_search_history_timestamp ON search_history (timestamp)")
+
+
+            # Create default admin if it doesn't exist
+            c.execute("SELECT username FROM users WHERE username = 'admin'")
+            if not c.fetchone():
+                # Use a more secure way to handle salt in a real application
+                salt = "salt_key" # Example salt, should be unique and stored securely
+                admin_pass = "adminpass"
+                user_pass = "password"
+
+                admin_hash = hashlib.sha256(f"{admin_pass}:{salt}".encode()).hexdigest()
+                user_hash = hashlib.sha256(f"{user_pass}:{salt}".encode()).hexdigest()
+
+                # Create admin user
+                c.execute(
+                    "INSERT INTO users (username, password_hash, role, email, full_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("admin", admin_hash, "admin", "admin@example.com", "System Administrator", datetime.datetime.now().isoformat())
+                )
+
+                # Create regular user account
+                c.execute(
+                    "INSERT INTO users (username, password_hash, role, email, full_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    ("user", user_hash, "user", "user@example.com", "Regular User", datetime.datetime.now().isoformat())
+                )
+
+                # Log the creation (using the function ensures consistent logging)
+                log_action("system", "create_user", "Created default admin and regular user", conn) # Pass connection
+
+            conn.commit() # Commit changes
+        return True
+    except sqlite3.Error as e:
+        st.error(f"❌ Database initialization error: {str(e)}")
+        # Log the detailed error for backend debugging
+        print(f"Database initialization failed: {e}")
+        return False
+    except Exception as e:
+        st.error(f"❌ An unexpected error occurred during database initialization: {str(e)}")
+        print(f"Unexpected error during DB init: {e}")
+        return False
+
+# --- Logging ---
+def log_action(user_id, action, details=None, conn=None):
+    """Log an action to the audit log. Can accept an existing connection."""
+    log_id = str(uuid.uuid4())
+    timestamp = datetime.datetime.now().isoformat()
+    log_entry = (log_id, user_id, action, details, timestamp)
+
+    # Flag to check if we need to close the connection
+    should_close_conn = False
+    if conn is None:
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=20.0)
+            should_close_conn = True
+        except sqlite3.Error as e:
+            st.error(f"🚨 Logging error (connection): {str(e)}")
+            print(f"Logging connection error: {e}")
+            return None
+
+    try:
+        c = conn.cursor()
+        c.execute("INSERT INTO audit_log VALUES (?, ?, ?, ?, ?)", log_entry)
+        if should_close_conn: # Only commit if we opened the connection here
+             conn.commit()
+        return log_id
+    except sqlite3.Error as e:
+        st.error(f"🚨 Logging error (execution): {str(e)}")
+        print(f"Logging execution error: {e}")
+        return None
+    finally:
+        if should_close_conn and conn:
+            conn.close()
+
+
+# --- OpenAI & Embeddings ---
 def get_openai_client():
     """Get an OpenAI client with proper error handling"""
+    api_key = st.session_state.get("openai_api_key")
+
+    # If not in session state, try environment variable
+    if not api_key:
+        api_key = os.getenv("OPENAI_API_KEY")
+
+    # If not in environment, try Streamlit secrets
+    if not api_key:
+        try:
+            api_key = st.secrets["OPENAI_API_KEY"]
+        except (AttributeError, KeyError): # Handle cases where secrets aren't available or key missing
+             pass # Keep api_key as None or empty
+
+    if not api_key:
+        st.error("❌ OPENAI_API_KEY is missing. Please add it in your environment, Streamlit secrets, or settings.")
+        # Log this critical error
+        print("CRITICAL: OpenAI API key is missing.")
+        # Don't stop the entire app, allow admin functions if possible
+        # st.stop()
+        return None # Return None to indicate failure
+
     try:
-        # Try to get from session state first
-        api_key = st.session_state.get("openai_api_key")
-        
-        # If not in session state, try environment variable
-        if not api_key:
-            api_key = os.getenv("OPENAI_API_KEY")
-        
-        # If not in environment, try Streamlit secrets
-        if not api_key:
-            try:
-                api_key = st.secrets["OPENAI_API_KEY"]
-            except:
-                pass
-        
-        if not api_key:
-            st.error("❌ OPENAI_API_KEY is missing. Please add it in your environment or settings.")
-            st.stop()
-            
         client = OpenAI(api_key=api_key)
+        # Perform a simple test call to validate the key
+        client.models.list()
         return client
     except Exception as e:
-        st.error(f"Error initializing OpenAI client: {e}")
-        st.stop()
+        st.error(f"❌ Error initializing or validating OpenAI client: {e}")
+        print(f"OpenAI client initialization error: {e}")
+        # st.stop() # Don't stop the entire app
+        return None
 
 def get_embedding(text, model="text-embedding-3-small"):
     """Get embedding vector for text using OpenAI API"""
     client = get_openai_client()
-    
+    if not client:
+        st.error("⚠️ OpenAI client not available. Cannot generate embeddings.")
+        raise ConnectionError("OpenAI client failed to initialize") # Raise specific error
+
     try:
         # Clean and prepare text
         text = text.replace("\n", " ").strip()
-        
-        # Handle empty text
+
+        # Handle empty text after cleaning
         if not text:
-            return np.zeros(1536, dtype=np.float32)  # Default dimension for embeddings
-            
+            st.warning("⚠️ Attempted to get embedding for empty text.")
+            # Return zero vector matching the expected dimension for the model
+            # Dimension for text-embedding-3-small is 1536
+            return np.zeros(1536, dtype=np.float32)
+
         response = client.embeddings.create(
             input=[text],
             model=model
         )
         embedding = np.array(response.data[0].embedding, dtype=np.float32)
-        
-        # Normalize for cosine similarity
+
+        # Normalize for cosine similarity (important for IndexFlatIP)
         norm = np.linalg.norm(embedding)
         if norm > 0:
             embedding = embedding / norm
-            
-        return embedding
-        
-    except Exception as e:
-        st.error(f"Error creating embedding: {e}")
-        raise
+        else:
+            # Handle zero vector case if it occurs, though unlikely for non-empty text
+            st.warning("⚠️ Generated a zero vector embedding for non-empty text.")
 
+        return embedding
+
+    except Exception as e:
+        st.error(f"❌ Error creating embedding: {e}")
+        print(f"Embedding generation error for text snippet '{text[:50]}...': {e}")
+        raise # Re-raise the exception to be caught by the caller
+
+# --- Index Management ---
 def rebuild_index_from_db():
     """Rebuild the search index from database records"""
+    st.info("Attempting to rebuild the search index...")
+    client = get_openai_client()
+    if not client:
+         st.error("❌ Cannot rebuild index: OpenAI client is not configured.")
+         return False, 0
+
+    all_embeddings = []
+    metadata = []
+    processed_chunk_ids = set() # To track processed chunks
+
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=20.0)
-        c = conn.cursor()
-        
-        # Get all active document chunks
-        c.execute('''
-        SELECT c.chunk_id, c.text, d.filename, d.category, d.doc_id
-        FROM chunks c
-        JOIN documents d ON c.doc_id = d.doc_id
-        WHERE d.is_active = 1
-        ''')
-        
-        results = c.fetchall()
-        conn.close()
-        
-        all_embeddings = []
-        metadata = []
-        
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn: # Increased timeout
+            c = conn.cursor()
+
+            # Get all active document chunks with necessary metadata
+            c.execute('''
+            SELECT c.chunk_id, c.text, d.filename, d.category, d.doc_id
+            FROM chunks c
+            JOIN documents d ON c.doc_id = d.doc_id
+            WHERE d.is_active = 1
+            ''')
+
+            results = c.fetchall()
+
+        if not results:
+            st.warning("⚠️ No active document chunks found in the database to build the index.")
+             # If no results, create empty index files
+            dimension = 1536 # Default for text-embedding-3-small
+            empty_index = faiss.IndexFlatIP(dimension)
+            faiss.write_index(empty_index, INDEX_PATH)
+            with open(DOCS_METADATA_PATH, "wb") as f:
+                pickle.dump([], f)
+            st.success("✅ Created empty index files as no active documents were found.")
+            return True, 0 # Indicate success but with 0 items
+
+        st.write(f"Found {len(results)} active chunks to process.")
         progress_bar = st.progress(0)
         status_text = st.empty()
-        
+
         for i, (chunk_id, text, filename, category, doc_id) in enumerate(results):
-            status_text.text(f"Processing chunk {i+1}/{len(results)}")
-            progress_bar.progress((i + 1) / len(results))
-            
-            # Generate embedding for each chunk
-            embedding = get_embedding(text)
-            all_embeddings.append(embedding)
-            
-            # Create metadata entry
-            meta = {
-                "chunk_id": chunk_id,
-                "text": text,
-                "source": filename,
-                "category": category,
-                "doc_id": doc_id
-            }
-            metadata.append(meta)
-        
-        # Create and save FAISS index
-        if all_embeddings:
-            all_embeddings = np.array(all_embeddings, dtype=np.float32)
-            dimension = all_embeddings.shape[1]
-            
-            index = faiss.IndexFlatIP(dimension)  # Inner product for cosine similarity
-            
-            # Normalize vectors for cosine similarity
-            faiss.normalize_L2(all_embeddings)
-            index.add(all_embeddings)
-            
-            # Save index and metadata
-            faiss.write_index(index, INDEX_PATH)
-            with open(DOCS_METADATA_PATH, "wb") as f:
-                pickle.dump(metadata, f)
-                
-            return True, len(metadata)
-        
+            status_text.text(f"Processing chunk {i+1}/{len(results)} (ID: {chunk_id})")
+            progress = (i + 1) / len(results)
+            progress_bar.progress(progress)
+
+            if not text or not text.strip():
+                st.warning(f"Skipping empty chunk: {chunk_id} from {filename}")
+                continue
+
+            try:
+                # Generate embedding for each chunk
+                embedding = get_embedding(text) # Use the robust function
+                all_embeddings.append(embedding)
+
+                # Create metadata entry
+                meta = {
+                    "chunk_id": chunk_id,
+                    "text": text,
+                    "source": filename,
+                    "category": category,
+                    "doc_id": doc_id
+                }
+                metadata.append(meta)
+                processed_chunk_ids.add(chunk_id)
+
+            except ConnectionError as ce: # Catch specific error from get_embedding
+                 st.error(f"❌ Failed to get embedding for chunk {chunk_id} due to OpenAI connection issue. Stopping rebuild.")
+                 print(f"OpenAI connection error during rebuild: {ce}")
+                 return False, 0 # Abort rebuild on critical API error
+            except Exception as e:
+                st.error(f"⚠️ Error processing chunk {chunk_id} from {filename}: {str(e)}. Skipping chunk.")
+                print(f"Error processing chunk {chunk_id}: {e}")
+                # Optionally: Log this chunk ID for later review
+                continue # Skip this chunk and continue with others
+
+        # --- Create and save FAISS index ---
+        if not all_embeddings or not metadata:
+             st.warning("⚠️ No embeddings were generated. Index cannot be built.")
+             # Create empty files if needed
+             if not os.path.exists(INDEX_PATH) or not os.path.exists(DOCS_METADATA_PATH):
+                 dimension = 1536
+                 empty_index = faiss.IndexFlatIP(dimension)
+                 faiss.write_index(empty_index, INDEX_PATH)
+                 with open(DOCS_METADATA_PATH, "wb") as f:
+                    pickle.dump([], f)
+                 st.success("✅ Created empty index files.")
+             return True, 0 # Success, but 0 items indexed
+
+
+        all_embeddings = np.array(all_embeddings, dtype=np.float32)
+
+        # Check for NaN or Inf values in embeddings (optional but good practice)
+        if np.isnan(all_embeddings).any() or np.isinf(all_embeddings).any():
+            st.error("❌ Invalid values (NaN or Inf) found in generated embeddings. Index build failed.")
+            print("ERROR: NaN or Inf found in embeddings.")
+            return False, 0
+
+        dimension = all_embeddings.shape[1]
+        st.write(f"Building FAISS index with dimension {dimension} for {len(metadata)} items.")
+
+        # Use IndexFlatIP for cosine similarity after normalization
+        index = faiss.IndexFlatIP(dimension)
+
+        # FAISS expects L2 normalized vectors for cosine similarity with IndexFlatIP
+        # Our get_embedding function already normalizes, so we just add.
+        # If get_embedding didn't normalize, we would use: faiss.normalize_L2(all_embeddings) here.
+        index.add(all_embeddings)
+        st.write(f"FAISS index created. Total vectors in index: {index.ntotal}")
+
+        # Save index and metadata
+        faiss.write_index(index, INDEX_PATH)
+        with open(DOCS_METADATA_PATH, "wb") as f:
+            pickle.dump(metadata, f)
+
+        status_text.text("Index rebuild complete.")
+        progress_bar.progress(1.0)
+        st.success(f"✅ Index rebuilt successfully with {len(metadata)} document chunks.")
+        log_action("system", "rebuild_index", f"Index rebuilt with {len(metadata)} chunks.")
+        return True, len(metadata)
+
+    except FileNotFoundError as e:
+        st.error(f"❌ File not found error during index rebuild: {str(e)}")
+        print(f"FileNotFoundError during rebuild: {e}")
         return False, 0
+    except pickle.PickleError as e:
+        st.error(f"❌ Error saving metadata (pickle error): {str(e)}")
+        print(f"PickleError during rebuild: {e}")
+        return False, 0
+    except faiss.FaissException as e:
+         st.error(f"❌ FAISS error during index build/save: {str(e)}")
+         print(f"FAISS error during rebuild: {e}")
+         return False, 0
     except Exception as e:
-        st.error(f"Error rebuilding index: {str(e)}")
+        # Catch any other unexpected errors
+        st.error(f"❌ An unexpected error occurred during index rebuild: {str(e)}")
+        import traceback
+        print(f"Unexpected error during rebuild: {e}\n{traceback.format_exc()}") # Log traceback
         return False, 0
 
 def load_search_index():
-    """Load the search index and metadata"""
+    """Load the search index and metadata, attempting rebuild if necessary."""
     try:
         if os.path.exists(INDEX_PATH) and os.path.exists(DOCS_METADATA_PATH):
             index = faiss.read_index(INDEX_PATH)
             with open(DOCS_METADATA_PATH, "rb") as f:
                 metadata = pickle.load(f)
+            st.sidebar.success(f"✅ Index loaded ({index.ntotal} vectors)") # Feedback in sidebar
+            # Basic sanity check
+            if index.ntotal != len(metadata):
+                 st.sidebar.warning(f"⚠️ Index size ({index.ntotal}) mismatch with metadata ({len(metadata)}). Consider rebuilding.")
             return index, metadata
         else:
-            # Try to rebuild the index
-            success, _ = rebuild_index_from_db()
+            st.sidebar.warning("⚠️ Index files not found. Attempting to rebuild...")
+            # Try to rebuild the index automatically
+            success, count = rebuild_index_from_db()
             if success:
-                index = faiss.read_index(INDEX_PATH)
-                with open(DOCS_METADATA_PATH, "rb") as f:
-                    metadata = pickle.load(f)
-                return index, metadata
+                st.sidebar.success(f"✅ Index rebuilt ({count} vectors).")
+                # Now try loading again
+                if os.path.exists(INDEX_PATH) and os.path.exists(DOCS_METADATA_PATH):
+                    index = faiss.read_index(INDEX_PATH)
+                    with open(DOCS_METADATA_PATH, "rb") as f:
+                        metadata = pickle.load(f)
+                    return index, metadata
+                else:
+                     st.sidebar.error("❌ Rebuild reported success, but index files still missing.")
+            else:
+                 st.sidebar.error("❌ Automatic index rebuild failed.")
+
+    except FileNotFoundError:
+        st.sidebar.error("❌ Index or metadata file not found during load.")
+    except pickle.UnpicklingError:
+         st.sidebar.error("❌ Error reading metadata file. It might be corrupted. Please rebuild.")
+    except faiss.FaissException as e:
+         st.sidebar.error(f"❌ FAISS error loading index: {e}. Please rebuild.")
     except Exception as e:
-        st.error(f"Error loading search index: {e}")
-        
-    # Return empty index and metadata as fallback
+        st.sidebar.error(f"❌ Unexpected error loading search index: {e}")
+        import traceback
+        print(f"Unexpected error loading index: {e}\n{traceback.format_exc()}")
+
+    # Return empty index and metadata as fallback if loading fails
+    st.sidebar.error("⚠️ Returning empty index.")
     dimension = 1536  # Default for OpenAI embeddings
     empty_index = faiss.IndexFlatIP(dimension)
     return empty_index, []
 
+# --- Search & Answer Generation ---
 def search_documents(query, k=5, threshold=0.7):
-    """Search for relevant documents."""
+    """Search for relevant documents using FAISS index."""
+    # --- Debug Start ---
+    st.write("--- Debug: Entering search_documents ---")
+    st.write(f"Query: '{query[:100]}...', k={k}, threshold={threshold}")
+    # --- Debug End ---
+
     # Load index and metadata
     index, metadata = load_search_index()
-    
+    # --- Debug Start ---
+    st.write(f"Debug: Index loaded - ntotal={index.ntotal}, Metadata length: {len(metadata)}")
+     # Check if index dimension matches expected embedding dimension
+    expected_dim = 1536 # For text-embedding-3-small
+    if index.ntotal > 0 and index.d != expected_dim:
+        st.warning(f"⚠️ Debug: Index dimension ({index.d}) does not match expected ({expected_dim})!")
+    # --- Debug End ---
+
+
     if index.ntotal == 0 or not metadata:
-        return []
-    
+        st.warning("Debug: Index is empty or no metadata found. Cannot perform search.") # Debug
+        return [] # Return empty list if index is not usable
+
     # Get query embedding
-    query_embedding = get_embedding(query)
-    query_embedding = query_embedding.reshape(1, -1)
-    
-    # Normalize for cosine similarity
-    faiss.normalize_L2(query_embedding)
-    
+    try:
+        st.write("Debug: Generating query embedding...") # Debug
+        query_embedding = get_embedding(query)
+        st.write(f"Debug: Query embedding shape: {query_embedding.shape}, norm: {np.linalg.norm(query_embedding):.4f}") # Debug
+        # Ensure it's 2D for FAISS search
+        query_embedding = query_embedding.reshape(1, -1)
+        # Ensure normalization (get_embedding should do this, but double-check)
+        if abs(np.linalg.norm(query_embedding) - 1.0) > 1e-5:
+             st.warning("⚠️ Debug: Query embedding norm is not 1 after get_embedding. Normalizing again.")
+             faiss.normalize_L2(query_embedding)
+
+    except Exception as e:
+        st.error(f"❌ Debug: Error during query embedding generation: {e}")
+        print(f"Error getting query embedding: {e}")
+        return [] # Cannot search without query embedding
+
     # Search the index
-    k = min(k, len(metadata))  # Don't request more results than we have
-    distances, indices = index.search(query_embedding, k)
-    
     results = []
-    for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-        if idx < len(metadata) and dist >= threshold:
-            doc = metadata[idx].copy()
-            doc["score"] = float(dist)
-            results.append(doc)
-    
+    try:
+        # Determine the actual number of neighbors to search for
+        actual_k = min(k, index.ntotal)
+        if actual_k <= 0:
+             st.warning("Debug: No neighbors to search for (k or index total is zero).")
+             return []
+
+        st.write(f"Debug: Searching index with k={actual_k}...") # Debug
+        # `index.search` returns distances (inner product scores for IndexFlatIP) and indices
+        distances, indices = index.search(query_embedding, actual_k)
+        st.write(f"Debug: Raw search results - Distances: {distances}, Indices: {indices}") # Debug
+
+        # Process results if any were found
+        if indices.size > 0 and distances.size > 0:
+            for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
+                 # FAISS can return -1 for indices if k > ntotal, though we handle k above
+                 if idx == -1:
+                      st.warning(f"Debug: FAISS returned index -1 for result {i}. Skipping.")
+                      continue
+
+                 st.write(f"Debug: Checking result {i}: Index={idx}, Distance (Score)={dist:.4f}") # Debug
+
+                 # Check index bounds rigorously
+                 if 0 <= idx < len(metadata):
+                     # Compare distance (score) with the threshold
+                     if dist >= threshold:
+                         # Make a copy to avoid modifying the original metadata list
+                         doc = metadata[idx].copy()
+                         doc["score"] = float(dist) # Add the score to the result
+                         results.append(doc)
+                         st.write(f"✅ Debug: Added result {i} (Score: {dist:.4f} >= {threshold}) - Source: {doc.get('source', 'N/A')}") # Debug
+                     else:
+                         st.write(f"📉 Debug: Result {i} below threshold ({dist:.4f} < {threshold})") # Debug
+                 else:
+                     # This should ideally not happen if index and metadata are in sync
+                     st.warning(f"🚨 Debug: Result index {idx} is out of bounds for metadata (length {len(metadata)}). Index might be corrupted or out of sync!") # Debug
+
+    except faiss.FaissException as e:
+         st.error(f"❌ Debug: Error during FAISS index search: {e}")
+         print(f"FAISS search error: {e}")
+         return [] # Return empty on search error
+    except Exception as e:
+        st.error(f"❌ Debug: Unexpected error during index search processing: {e}")
+        import traceback
+        print(f"Unexpected search processing error: {e}\n{traceback.format_exc()}")
+        return []
+
+    # Sort results by score (descending) before returning
+    results.sort(key=lambda x: x.get('score', 0), reverse=True)
+
+    st.write(f"--- Debug: Exiting search_documents - Found {len(results)} results passing threshold ---") # Debug
     return results
+
 
 def generate_answer(query, model="gpt-3.5-turbo", include_explanation=True, temp=0.2):
     """Generate an answer to a query based on retrieved documents."""
     client = get_openai_client()
-    
-    # Record search in history
+    if not client:
+         st.error("❌ Cannot generate answer: OpenAI client not available.")
+         # Return a structured error message
+         return {
+            "question_id": str(uuid.uuid4()),
+            "query": query,
+            "answer": "Error: Could not connect to the language model service.",
+            "sources": [],
+            "model": model,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "source_type": "Error"
+        }
+
+    history_id = str(uuid.uuid4())
+    username = st.session_state.get("username", "unknown_user") # Handle missing username
+
+    # --- Record search attempt in history ---
+    conn_hist = None
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=20.0)
-        c = conn.cursor()
-        
-        history_id = str(uuid.uuid4())
-        c.execute(
-            "INSERT INTO search_history VALUES (?, ?, ?, ?, ?)",
-            (
-                history_id,
-                st.session_state["username"],
-                query,
-                datetime.datetime.now().isoformat(),
-                0  # Will update this with results count
-            )
+        conn_hist = sqlite3.connect(DB_PATH, timeout=20.0)
+        c_hist = conn_hist.cursor()
+        c_hist.execute(
+            "INSERT INTO search_history (history_id, user_id, query, timestamp, num_results) VALUES (?, ?, ?, ?, ?)",
+            (history_id, username, query, datetime.datetime.now().isoformat(), 0) # Initial results = 0
         )
-        conn.commit()
-        
-        # Update user history in session state
+        conn_hist.commit()
+
+        # Update user history in session state (optional, for UI)
         if "user_history" not in st.session_state:
             st.session_state["user_history"] = []
         st.session_state["user_history"].append({
             "query": query,
             "timestamp": datetime.datetime.now().isoformat()
         })
-    except Exception as e:
-        st.error(f"Error recording search history: {str(e)}")
-    
-    # Search for relevant documents
-    results = search_documents(query, k=K_RETRIEVE, threshold=SIMILARITY_THRESHOLD)
-    
-    # Update search history with result count
+        # Limit session history size if needed
+        max_hist_len = 10
+        if len(st.session_state["user_history"]) > max_hist_len:
+             st.session_state["user_history"] = st.session_state["user_history"][-max_hist_len:]
+
+    except sqlite3.Error as e:
+        st.error(f"⚠️ Error recording search history: {str(e)}")
+        print(f"History recording error: {e}")
+    finally:
+        if conn_hist:
+            conn_hist.close()
+
+    # --- Search for relevant documents ---
+    # Get search parameters from session state
+    k_retrieve = st.session_state.get("k_retrieve", 5)
+    similarity_threshold = st.session_state.get("similarity_threshold", 0.75)
+
     try:
-        c.execute(
+        results = search_documents(query, k=k_retrieve, threshold=similarity_threshold)
+    except Exception as e:
+         st.error(f"❌ Error during document search: {e}")
+         results = [] # Ensure results is an empty list on error
+
+    # --- Update search history with result count ---
+    conn_update = None
+    try:
+        conn_update = sqlite3.connect(DB_PATH, timeout=20.0)
+        c_update = conn_update.cursor()
+        c_update.execute(
             "UPDATE search_history SET num_results = ? WHERE history_id = ?",
             (len(results), history_id)
         )
-        conn.commit()
-    except Exception as e:
-        st.error(f"Error updating search history: {str(e)}")
+        conn_update.commit()
+    except sqlite3.Error as e:
+        st.error(f"⚠️ Error updating search history result count: {str(e)}")
+        print(f"History update error: {e}")
     finally:
-        conn.close()
-    
-    # Initialize response structure
+        if conn_update:
+            conn_update.close()
+
+    # --- Prepare response structure ---
     answer_data = {
         "question_id": str(uuid.uuid4()),
         "query": query,
         "answer": "",
-        "sources": results,
+        "sources": results, # Include full results with scores
         "model": model,
-        "timestamp": datetime.datetime.now().isoformat()
+        "timestamp": datetime.datetime.now().isoformat(),
+        "source_type": "No Relevant Documents" # Default assumption
     }
-    
+
+    # --- Generate Answer using LLM ---
     try:
+        prompt = ""
         if results:
-            # Prepare context from retrieved chunks
+            answer_data["source_type"] = "Retrieved Documents"
+            # Prepare context from retrieved chunks, sorted by score
             context_pieces = []
-            for result in results:
-                chunk = f"Source: {result['source']} (Category: {result.get('category', 'Uncategorized')})\n\n{result['text']}"
+            for i, result in enumerate(results):
+                # Ensure essential keys exist
+                source = result.get('source', 'Unknown Source')
+                category = result.get('category', 'Uncategorized')
+                text = result.get('text', 'No text available')
+                score = result.get('score', 0.0)
+                chunk = f"Source {i+1}: {source} (Category: {category}, Score: {score:.3f})\n\n{text}"
                 context_pieces.append(chunk)
-            
+
             context = "\n\n---\n\n".join(context_pieces)
-            
-            # Build prompt
+
+            # Build prompt based on settings
             if include_explanation:
                 prompt = f"""
-You are a clinical expert assistant for pharmacists. Answer the following question based ONLY on the provided document excerpts. 
-If the document excerpts don't contain the information needed to answer the question, 
-say "I don't have enough information about this in the provided documents."
+You are PharmInsight, a clinical expert assistant for pharmacists. Your knowledge is based *only* on the provided document excerpts.
+Answer the user's question concisely and accurately using *only* the information within these excerpts.
+If the excerpts do not contain the information needed, clearly state that the information is not available in the provided documents.
+Do not add any information not present in the excerpts.
 
 **Document Excerpts:**
+--- START OF EXCERPTS ---
 {context}
+--- END OF EXCERPTS ---
 
-**Question:**
+**User's Question:**
 {query}
 
-Provide your answer in this format:
+**Instructions:**
+1.  Provide a direct answer to the question based *only* on the excerpts.
+2.  If the answer is found, provide a detailed explanation, citing the specific source number(s) (e.g., "Source 1", "Source 3") for each piece of information in your explanation.
+3.  List the source number(s) used for the answer.
+4.  If the information is not in the excerpts, state: "I cannot answer this question based on the provided documents."
+
+**Output Format:**
 
 **Answer:**
-[A direct and concise answer to the question]
+[Your direct answer based *only* on the excerpts, or the "cannot answer" statement.]
 
 **Explanation:**
-[A detailed explanation with specific information from the documents]
+[Detailed explanation citing sources, e.g., "According to Source 1, ... . Source 2 adds that ... ."]
+[If you cannot answer, state: "No explanation available as the information was not found in the provided documents."]
 
-**Sources:**
-[List the sources of information used]
+**Sources Used:**
+[List source numbers, e.g., "Source 1, Source 3"]
+[If you cannot answer, state: "None"]
 """
             else:
                 prompt = f"""
-You are a clinical expert assistant for pharmacists. Answer the following question based ONLY on the provided document excerpts.
-If the document excerpts don't contain the information needed to answer the question, 
-say "I don't have enough information about this in the provided documents."
+You are PharmInsight, a clinical expert assistant for pharmacists. Answer the following question based *only* on the provided document excerpts.
+If the document excerpts don't contain the information needed to answer the question, state: "I cannot answer this question based on the provided documents."
+Do not add any information not present in the excerpts.
 
 **Document Excerpts:**
+--- START OF EXCERPTS ---
 {context}
+--- END OF EXCERPTS ---
 
-**Question:**
+**User's Question:**
 {query}
 
-Provide your answer in this format:
+**Output Format:**
 
 **Answer:**
-[A direct and concise answer to the question]
+[Your direct answer based *only* on the excerpts, or the "cannot answer" statement.]
 """
-            answer_source = "Retrieved Documents"
+            st.write("--- Debug: Prompt sent to LLM (showing first 500 chars) ---") # Debug
+            st.text(prompt[:500] + "...") # Debug
+            st.write("--- End Debug Prompt ---") # Debug
+
         else:
-            # No relevant documents found
-            prompt = f"""
-You are a clinical expert assistant for pharmacists. No relevant document was found for the following question:
+            # No relevant documents found - Construct a simple response directly
+            answer_data["answer"] = "I don't have specific information about this in the provided documents. Please consider consulting official clinical guidelines or pharmacist resources for accurate information."
+            st.warning("Debug: No relevant documents found by search.") # Debug
+            # Skip LLM call if no results
+            return answer_data
 
-Question: {query}
 
-Please respond with:
-"I don't have specific information about this in the provided documents. Please consider consulting official clinical guidelines or pharmacist resources for accurate information."
-"""
-            answer_source = "No Relevant Documents"
-
-        # Generate the answer using the LLM
+        # --- Call LLM API ---
+        st.write(f"Debug: Calling LLM model: {model} with temp={temp}") # Debug
         response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "You are an expert clinical assistant for pharmacists."},
+                {"role": "system", "content": "You are PharmInsight, an expert clinical assistant for pharmacists, answering questions based *only* on provided text excerpts."},
                 {"role": "user", "content": prompt}
             ],
             temperature=temp,
-            max_tokens=1000
+            max_tokens=1000 # Adjust as needed
         )
-        
+
         answer = response.choices[0].message.content
-        
+        st.write("--- Debug: Raw LLM Response ---") # Debug
+        st.text(answer) # Debug
+        st.write("--- End Debug LLM Response ---") # Debug
+
         # Update answer data
-        answer_data["answer"] = answer
-        answer_data["source_type"] = answer_source
-        
-        # Store the Q&A pair in database
+        answer_data["answer"] = answer.strip()
+
+        # --- Store the Q&A pair in database ---
+        conn_qa = None
         try:
-            conn = sqlite3.connect(DB_PATH, timeout=20.0)
-            c = conn.cursor()
-            
-            c.execute(
-                "INSERT INTO qa_pairs VALUES (?, ?, ?, ?, ?, ?, ?)",
+            conn_qa = sqlite3.connect(DB_PATH, timeout=20.0)
+            c_qa = conn_qa.cursor()
+            # Extract just the source filenames for storage
+            source_filenames = json.dumps([s.get("source", "") for s in answer_data["sources"]])
+            c_qa.execute(
+                "INSERT INTO qa_pairs (question_id, user_id, query, answer, timestamp, sources, model_used) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     answer_data["question_id"],
-                    st.session_state["username"],
+                    username,
                     answer_data["query"],
                     answer_data["answer"],
                     answer_data["timestamp"],
-                    json.dumps([s.get("source", "") for s in answer_data["sources"]]),
+                    source_filenames,
                     answer_data["model"]
                 )
             )
-            
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            st.error(f"Error storing Q&A pair: {str(e)}")
-        
+            conn_qa.commit()
+        except sqlite3.Error as e:
+            st.error(f"⚠️ Error storing Q&A pair: {str(e)}")
+            print(f"QA storage error: {e}")
+        finally:
+            if conn_qa:
+                conn_qa.close()
+
         return answer_data
-            
+
     except Exception as e:
-        error_message = f"Error generating answer: {str(e)}"
-        answer_data["answer"] = error_message
+        error_message = f"❌ Error generating answer: {str(e)}"
+        st.error(error_message)
+        import traceback
+        print(f"Answer generation error: {e}\n{traceback.format_exc()}")
+        answer_data["answer"] = f"An error occurred while generating the answer. Details: {str(e)}"
         answer_data["source_type"] = "Error"
         return answer_data
 
+# --- Feedback ---
 def submit_feedback(question_id, rating, comment=None):
     """Submit feedback for an answer"""
-    # Validate rating is in the 1-3 range
-    if rating < 1 or rating > 3:
+    # Validate rating
+    if not 1 <= rating <= 3:
         st.error("Rating must be between 1 and 3")
         return False
-        
+
+    feedback_id = str(uuid.uuid4())
+    username = st.session_state.get("username", "unknown_user")
+    timestamp = datetime.datetime.now().isoformat()
+
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH, timeout=20.0)
         c = conn.cursor()
-        
-        feedback_id = str(uuid.uuid4())
-        
+
         c.execute(
-            "INSERT INTO feedback VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                feedback_id,
-                question_id,
-                st.session_state["username"],
-                rating,
-                comment,
-                datetime.datetime.now().isoformat()
-            )
+            "INSERT INTO feedback (feedback_id, question_id, user_id, rating, comment, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (feedback_id, question_id, username, rating, comment, timestamp)
         )
-        
         conn.commit()
-        
+
         log_action(
-            st.session_state["username"],
+            username,
             "submit_feedback",
-            f"User submitted feedback for question {question_id} with rating {rating}"
+            f"Feedback submitted for QID {question_id}. Rating: {rating}. Comment: '{comment[:50]}...'",
+            conn # Pass connection to log_action
         )
-        
-        conn.close()
+        # No need to commit again here, log_action doesn't commit if conn is passed
+
         return True
-    except Exception as e:
-        st.error(f"Error submitting feedback: {str(e)}")
+    except sqlite3.Error as e:
+        st.error(f"❌ Error submitting feedback: {str(e)}")
+        print(f"Feedback submission error: {e}")
+        # Rollback if necessary? Depends on transaction handling.
         return False
+    finally:
+        if conn:
+            conn.close()
+
 
 def feedback_ui(question_id):
-    """Display feedback collection UI"""
+    """Display feedback collection UI, managing state within the function."""
     st.divider()
-    
-    with st.expander("📊 Rate this answer", expanded=False):
-        st.write("Your feedback helps us improve the system")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        rating = None
-        
-        with col1:
-            if st.button("1 - Not Helpful", key=f"rate_1_{question_id}"):
-                rating = 1
-        with col2:
-            if st.button("2 - Somewhat Helpful", key=f"rate_2_{question_id}"):
-                rating = 2
-        with col3:
-            if st.button("3 - Very Helpful", key=f"rate_3_{question_id}"):
-                rating = 3
-                
-        if rating:
-            st.session_state["show_feedback_form"] = True
-            st.session_state["selected_rating"] = rating
-            
-        # Show comment field if a rating was selected
-        if st.session_state.get("show_feedback_form", False):
-            selected_rating = st.session_state.get("selected_rating", 2)
-            
-            # Show the selected rating
-            if selected_rating == 1:
-                st.write("You selected: Not Helpful")
-            elif selected_rating == 2:
-                st.write("You selected: Somewhat Helpful")
-            else:
-                st.write("You selected: Very Helpful")
-                
-            comments = st.text_area("Additional comments (optional)", key=f"comments_{question_id}")
-            
-            if st.button("Submit Feedback", key=f"submit_{question_id}"):
-                success = submit_feedback(
-                    question_id,
-                    selected_rating,
-                    comments
-                )
-                
+
+    # Use unique keys based on question_id for state isolation
+    feedback_state_key = f"feedback_state_{question_id}"
+    rating_key = f"rating_{question_id}"
+    comment_key = f"comment_{question_id}"
+    submitted_key = f"submitted_{question_id}"
+
+    # Initialize state for this specific feedback instance if not present
+    if feedback_state_key not in st.session_state:
+        st.session_state[feedback_state_key] = {"rating": None, "submitted": False}
+
+    # Prevent showing feedback UI if already submitted for this question_id
+    if st.session_state[feedback_state_key]["submitted"]:
+        st.success("✅ Thank you for your feedback on this answer!")
+        return
+
+    with st.expander("📊 Rate this answer", expanded=True): # Keep expanded until submitted
+        st.write("Your feedback helps improve PharmInsight!")
+
+        cols = st.columns(3)
+        rating_buttons = {1: "1 - Not Helpful", 2: "2 - Somewhat Helpful", 3: "3 - Very Helpful"}
+
+        # Display buttons and update rating state on click
+        for r, label in rating_buttons.items():
+            button_key = f"rate_{r}_{question_id}"
+            if cols[r-1].button(label, key=button_key, use_container_width=True):
+                st.session_state[feedback_state_key]["rating"] = r
+                # Rerun to update the UI showing the comment box
+                st.rerun()
+
+        # Show comment area and submit button if a rating is selected
+        selected_rating = st.session_state[feedback_state_key].get("rating")
+        if selected_rating:
+            st.write(f"You selected: **{rating_buttons[selected_rating]}**")
+            comment = st.text_area("Additional comments (optional)", key=comment_key)
+
+            if st.button("Submit Feedback", key=f"submit_btn_{question_id}"):
+                success = submit_feedback(question_id, selected_rating, comment)
                 if success:
-                    st.success("Thank you for your feedback!")
-                    # Reset the feedback state
-                    st.session_state["show_feedback_form"] = False
-                    st.session_state["selected_rating"] = None
+                    st.session_state[feedback_state_key]["submitted"] = True
+                    # Clear rating/comment for this instance? Optional.
+                    # st.session_state[feedback_state_key]["rating"] = None
+                    # st.session_state[comment_key] = "" # Clear comment field if needed
+                    st.success("✅ Feedback submitted successfully!")
+                    st.rerun() # Rerun to show the "Thank you" message and collapse expander
                 else:
-                    st.error("Error submitting feedback. Please try again.")
+                    st.error("❌ Error submitting feedback. Please try again.")
 
-# Database initialization function
-def init_database():
-    """Initialize all database tables"""
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=20.0)
-        c = conn.cursor()
-        
-        # Users table
-        c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL,
-            email TEXT,
-            full_name TEXT,
-            created_at TIMESTAMP,
-            last_login TIMESTAMP
-        )
-        ''')
-        
-        # Documents table
-        c.execute('''
-        CREATE TABLE IF NOT EXISTS documents (
-            doc_id TEXT PRIMARY KEY,
-            filename TEXT NOT NULL,
-            upload_date TIMESTAMP,
-            uploader TEXT NOT NULL,
-            category TEXT,
-            description TEXT,
-            expiry_date TEXT,
-            is_active INTEGER DEFAULT 1
-        )
-        ''')
-        
-        # Document chunks table
-        c.execute('''
-        CREATE TABLE IF NOT EXISTS chunks (
-            chunk_id TEXT PRIMARY KEY,
-            doc_id TEXT NOT NULL,
-            text TEXT NOT NULL,
-            embedding BLOB,
-            FOREIGN KEY (doc_id) REFERENCES documents(doc_id)
-        )
-        ''')
-        
-        # Questions and answers table
-        c.execute('''
-        CREATE TABLE IF NOT EXISTS qa_pairs (
-            question_id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            query TEXT NOT NULL,
-            answer TEXT NOT NULL,
-            timestamp TIMESTAMP,
-            sources TEXT,
-            model_used TEXT
-        )
-        ''')
-        
-        # Feedback table with 3-point rating scale
-        c.execute('''
-        CREATE TABLE IF NOT EXISTS feedback (
-            feedback_id TEXT PRIMARY KEY,
-            question_id TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 3),
-            comment TEXT,
-            timestamp TIMESTAMP,
-            FOREIGN KEY (question_id) REFERENCES qa_pairs(question_id)
-        )
-        ''')
-        
-        # Audit log table
-        c.execute('''
-        CREATE TABLE IF NOT EXISTS audit_log (
-            log_id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            action TEXT NOT NULL,
-            details TEXT,
-            timestamp TIMESTAMP
-        )
-        ''')
-        
-        # User search history
-        c.execute('''
-        CREATE TABLE IF NOT EXISTS search_history (
-            history_id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            query TEXT NOT NULL,
-            timestamp TIMESTAMP,
-            num_results INTEGER
-        )
-        ''')
-        
-        # Create default admin if it doesn't exist
-        c.execute("SELECT username FROM users WHERE username = 'admin'")
-        if not c.fetchone():
-            # Create with default password 'adminpass'
-            password_hash = hashlib.sha256(f"adminpass:salt_key".encode()).hexdigest()
-            c.execute(
-                "INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?)",
-                ("admin", password_hash, "admin", "admin@example.com", "System Administrator", 
-                 datetime.datetime.now().isoformat(), None)
-            )
-            
-            # Create regular user account
-            user_hash = hashlib.sha256(f"password:salt_key".encode()).hexdigest()
-            c.execute(
-                "INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?)",
-                ("user", user_hash, "user", "user@example.com", "Regular User", 
-                 datetime.datetime.now().isoformat(), None)
-            )
-            
-            # Log the creation
-            log_id = str(uuid.uuid4())
-            timestamp = datetime.datetime.now().isoformat()
-            c.execute(
-                "INSERT INTO audit_log VALUES (?, ?, ?, ?, ?)",
-                (log_id, "system", "create_user", "Created default admin and regular user", timestamp)
-            )
-            
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        st.error(f"Database initialization error: {str(e)}")
-        return False
 
-def log_action(user_id, action, details=None):
-    """Log an action to the audit log"""
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=20.0)
-        c = conn.cursor()
-        
-        log_id = str(uuid.uuid4())
-        timestamp = datetime.datetime.now().isoformat()
-        
-        c.execute(
-            "INSERT INTO audit_log VALUES (?, ?, ?, ?, ?)",
-            (log_id, user_id, action, details, timestamp)
-        )
-        
-        conn.commit()
-        conn.close()
-        return log_id
-    except Exception as e:
-        st.error(f"Logging error: {str(e)}")
-        return None
-
+# --- Authentication ---
 def verify_password(username, password):
-    """Verify username and password"""
+    """Verify username and password against the database."""
+    if not username or not password:
+        return False, None # Basic validation
+
+    # Use a more secure way to handle salt in a real application
+    salt = "salt_key" # Example salt, should match the one used in init_database/user creation
+    calculated_hash = hashlib.sha256(f"{password}:{salt}".encode()).hexdigest()
+
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH, timeout=20.0)
         c = conn.cursor()
-        
+
         c.execute("SELECT password_hash, role FROM users WHERE username = ?", (username,))
         result = c.fetchone()
-        
+
         if result:
             stored_hash, role = result
-            calculated_hash = hashlib.sha256(f"{password}:salt_key".encode()).hexdigest()
-            
             if calculated_hash == stored_hash:
+                # --- Password verified ---
                 # Update last login time
-                c.execute(
-                    "UPDATE users SET last_login = ? WHERE username = ?",
-                    (datetime.datetime.now().isoformat(), username)
-                )
-                conn.commit()
-                
-                # Log successful login
-                log_action(username, "login", "Successful login")
-                
-                conn.close()
+                try:
+                    c.execute(
+                        "UPDATE users SET last_login = ? WHERE username = ?",
+                        (datetime.datetime.now().isoformat(), username)
+                    )
+                    conn.commit() # Commit login time update
+                except sqlite3.Error as e:
+                     st.warning(f"⚠️ Could not update last login time for {username}: {e}")
+                     print(f"Login time update failed for {username}: {e}")
+                     # Continue with login even if timestamp update fails
+
+                # Log successful login (pass connection to avoid re-opening)
+                log_action(username, "login", "Successful login", conn)
+                # No need to commit again here
+
                 return True, role
-        
-        # Log failed login attempt
-        if username:
-            log_action("system", "failed_login", f"Failed login attempt for user: {username}")
-            
-        conn.close()
+            else:
+                 # --- Password mismatch ---
+                 log_action(username, "failed_login", f"Failed login attempt (wrong password) for user: {username}", conn)
+                 return False, None
+        else:
+            # --- User not found ---
+            log_action("system", "failed_login", f"Failed login attempt (user not found): {username}", conn)
+            return False, None
+
+    except sqlite3.Error as e:
+        st.error(f"❌ Authentication error: {str(e)}")
+        print(f"Authentication DB error: {e}")
         return False, None
-    except Exception as e:
-        st.error(f"Authentication error: {str(e)}")
-        return False, None
+    finally:
+        if conn:
+            conn.close()
+
+
+# --- Streamlit UI & Pages ---
 
 # Initialize session state variables
 def initialize_session_state():
     """Initialize all session state variables."""
-    if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
-        
-    if "username" not in st.session_state:
-        st.session_state["username"] = None
-        
-    if "role" not in st.session_state:
-        st.session_state["role"] = None
-        
-    if "page" not in st.session_state:
-        st.session_state["page"] = "main"
-        
-    if "user_history" not in st.session_state:
-        st.session_state["user_history"] = []
-    
-    # Try to get OpenAI API key from secrets first, then environment
-    if "openai_api_key" not in st.session_state:
-        try:
-            st.session_state["openai_api_key"] = st.secrets["OPENAI_API_KEY"]
-        except:
-            st.session_state["openai_api_key"] = os.getenv("OPENAI_API_KEY", "")
-    
-    if "embedding_model" not in st.session_state:
-        st.session_state["embedding_model"] = "text-embedding-3-small"
-    if "show_feedback_form" not in st.session_state:
-        st.session_state["show_feedback_form"] = False
-    if "current_question_id" not in st.session_state:
-        st.session_state["current_question_id"] = None
-        
-    # Search settings
-    if "k_retrieve" not in st.session_state:
-        st.session_state["k_retrieve"] = 5
-        
-    if "similarity_threshold" not in st.session_state:
-        st.session_state["similarity_threshold"] = 0.75
-        
-    if "llm_model" not in st.session_state:
-        st.session_state["llm_model"] = "gpt-3.5-turbo"
-        
-    if "temperature" not in st.session_state:
-        st.session_state["temperature"] = 0.2
-        
-    if "include_explanation" not in st.session_state:
-        st.session_state["include_explanation"] = True
+    defaults = {
+        "authenticated": False,
+        "username": None,
+        "role": None,
+        "page": "login", # Start at login page
+        "user_history": [],
+        "openai_api_key": None, # Will be populated by get_openai_client logic
+        "embedding_model": "text-embedding-3-small",
+        # Feedback state is handled per-question_id in feedback_ui
+        # "show_feedback_form": False, # Removed, handled locally
+        # "current_question_id": None, # Removed, handled locally
+        "k_retrieve": 5,
+        "similarity_threshold": 0.75,
+        "llm_model": "gpt-3.5-turbo",
+        "temperature": 0.2,
+        "include_explanation": True,
+        "current_query": None, # Used for re-running searches
+        # Admin page states
+        "show_reset_password": False,
+        "show_change_role": False,
+        "show_delete_user": False,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+    # Attempt to load API key early if not already set
+    if not st.session_state.get("openai_api_key"):
+         client = get_openai_client() # This function handles env/secrets logic
+         # We don't strictly need the client object here, just trigger the key load
+         # The key is stored in session_state by get_openai_client if found
+
 
 def is_admin():
     """Check if current user is an admin"""
@@ -707,1760 +998,1271 @@ def is_admin():
 def render_sidebar():
     """Render the application sidebar"""
     with st.sidebar:
-        st.image("https://www.svgrepo.com/show/530588/chemical-laboratory.svg", width=50)
-        st.title("PharmInsight")
-        st.caption(f"v{APP_VERSION}")
-        
-        # Show user info
-        if st.session_state["authenticated"]:
-            st.write(f"Logged in as: **{st.session_state['username']}** ({st.session_state['role']})")
-            if st.button("Logout"):
-                log_action(st.session_state["username"], "logout", "User logged out")
-                st.session_state["authenticated"] = False
-                st.session_state["username"] = None
-                st.session_state["role"] = None
-                st.session_state["page"] = "main"
+        # Use columns for better layout
+        col1, col2 = st.columns([1, 3])
+        with col1:
+             st.image("https://www.svgrepo.com/show/530588/chemical-laboratory.svg", width=50)
+        with col2:
+             st.title("PharmInsight")
+             st.caption(f"v{APP_VERSION}")
+
+        # Show user info if logged in
+        if st.session_state.get("authenticated"):
+            st.write(f"Logged in as: **{st.session_state.get('username', 'N/A')}**")
+            st.write(f"Role: *{st.session_state.get('role', 'N/A')}*")
+            if st.button("Logout", key="logout_button"):
+                username = st.session_state.get("username", "unknown_user")
+                log_action(username, "logout", "User logged out")
+                # Reset session state completely on logout
+                for key in list(st.session_state.keys()):
+                     del st.session_state[key]
+                # Re-initialize with defaults, setting page to login
+                initialize_session_state()
+                st.session_state["page"] = "login"
+                st.success("Logged out successfully.")
                 st.rerun()
-            
+
             st.divider()
-            
-            # Navigation
+
+            # --- Navigation ---
             st.subheader("Navigation")
-            
-            if st.button("📚 Home", use_container_width=True):
-                st.session_state["page"] = "main"
-                st.rerun()
-                
-            if st.button("👤 Your Profile", use_container_width=True):
-                st.session_state["page"] = "profile"
-                st.rerun()
-                
-            if st.button("📜 Search History", use_container_width=True):
-                st.session_state["page"] = "history"
-                st.rerun()
-                
-            # Admin-only options
+            nav_buttons = {
+                "main": "📚 Home / Search",
+                "profile": "👤 Your Profile",
+                "history": "📜 Search History",
+            }
+            for page_key, label in nav_buttons.items():
+                if st.button(label, key=f"nav_{page_key}", use_container_width=True):
+                    st.session_state["page"] = page_key
+                    st.rerun()
+
+            # --- Admin Navigation ---
             if is_admin():
                 st.divider()
-                st.subheader("Admin")
-                
-                if st.button("📄 Document Management", use_container_width=True):
-                    st.session_state["page"] = "admin_docs"
-                    st.rerun()
-                    
-                if st.button("👥 User Management", use_container_width=True):
-                    st.session_state["page"] = "admin_users"
-                    st.rerun()
-                    
-                if st.button("📊 Analytics", use_container_width=True):
-                    st.session_state["page"] = "admin_analytics"
-                    st.rerun()
-            
-            # Settings
+                st.subheader("Admin Panel")
+                admin_nav_buttons = {
+                    "admin_docs": "📄 Document Management",
+                    "admin_users": "👥 User Management",
+                    "admin_analytics": "📊 Analytics",
+                }
+                for page_key, label in admin_nav_buttons.items():
+                    if st.button(label, key=f"nav_{page_key}", use_container_width=True):
+                        st.session_state["page"] = page_key
+                        st.rerun()
+
+            # --- Settings ---
             st.divider()
             st.subheader("Settings")
-            
+
+            # OpenAI API Key Setting (Allow override)
+            with st.expander("API Key"):
+                 current_key = st.session_state.get("openai_api_key", "")
+                 new_key = st.text_input("OpenAI API Key", value=current_key, type="password", key="api_key_input", help="Overrides environment/secrets if set.")
+                 if new_key != current_key and new_key: # Update only if changed and not empty
+                      st.session_state["openai_api_key"] = new_key
+                      st.success("API Key updated in session.")
+                      # Optionally re-validate client
+                      get_openai_client() # Attempt validation
+                 elif not current_key and not new_key:
+                      st.warning("API Key not set.")
+
+
             with st.expander("Search Settings"):
-                st.slider("Results to retrieve", 3, 10, 
-                        st.session_state.get("k_retrieve", 5), 1, 
-                        key="k_retrieve")
-                
-                st.slider("Similarity threshold", 0.0, 1.0, 
-                        st.session_state.get("similarity_threshold", 0.75), 0.05, 
-                        key="similarity_threshold")
-                
+                # Use session state keys directly for widgets
+                st.slider("Results to retrieve (k)", min_value=1, max_value=15, value=st.session_state.get("k_retrieve", 5), step=1, key="k_retrieve")
+                st.slider("Similarity threshold", min_value=0.0, max_value=1.0, value=st.session_state.get("similarity_threshold", 0.75), step=0.05, key="similarity_threshold", format="%.2f")
+
             with st.expander("Model Settings"):
                 st.selectbox(
                     "LLM Model",
-                    ["gpt-3.5-turbo", "gpt-4-turbo", "gpt-4o"],
-                    index=0,
+                    ["gpt-3.5-turbo", "gpt-4-turbo", "gpt-4o"], # Add more models if needed
+                    index=["gpt-3.5-turbo", "gpt-4-turbo", "gpt-4o"].index(st.session_state.get("llm_model", "gpt-3.5-turbo")), # Find index safely
                     key="llm_model"
                 )
-                st.slider("Temperature", 0.0, 1.0, 0.2, 0.1, key="temperature")
-                st.checkbox("Include detailed explanations", value=True, key="include_explanation")
+                st.slider("Temperature (Creativity)", min_value=0.0, max_value=1.0, value=st.session_state.get("temperature", 0.2), step=0.1, key="temperature", format="%.1f")
+                st.checkbox("Include detailed explanations", value=st.session_state.get("include_explanation", True), key="include_explanation")
+
+        else:
+            # Sidebar content for logged-out users (minimal)
+            st.info("Please log in to access PharmInsight features.")
+
 
 def login_form():
     """Display login form"""
     st.header("Welcome to PharmInsight")
-    st.markdown("Please login to continue")
-    
-    col1, col2 = st.columns([1, 1])
-    
+    st.markdown("Please log in to continue.")
+
+    col1, col2 = st.columns([1, 1]) # Adjust column ratio if needed
+
     with col1:
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        
-        if st.button("Login", use_container_width=True):
-            if not username or not password:
-                st.error("Please enter both username and password")
-                return
-                
-            authenticated, role = verify_password(username, password)
-            if authenticated:
-                st.session_state["authenticated"] = True
-                st.session_state["username"] = username
-                st.session_state["role"] = role
-                st.success(f"Login successful! Welcome back, {username}.")
-                
-                # Clear any previous page selection
-                st.session_state["page"] = "main"
-                
-                # Force page refresh
-                st.rerun()
-            else:
-                st.error("Invalid username or password")
-    
+        with st.form("login_form"):
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input("Password", type="password", key="login_password")
+            submitted = st.form_submit_button("Login", use_container_width=True)
+
+            if submitted:
+                if not username or not password:
+                    st.error("Please enter both username and password.")
+                else:
+                    authenticated, role = verify_password(username, password)
+                    if authenticated:
+                        st.session_state["authenticated"] = True
+                        st.session_state["username"] = username
+                        st.session_state["role"] = role
+                        st.session_state["page"] = "main" # Redirect to main page
+                        st.success(f"Login successful! Welcome back, {username}.")
+                        # Short delay before rerun can improve UX
+                        import time
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("Invalid username or password.")
+
     with col2:
         st.markdown("""
-        ### PharmInsight
-        A clinical knowledge base for pharmacists.
-        
-        * Ask questions about drugs and clinical guidelines
-        * Get evidence-based answers with citations
-        * Access information from your organization's documents
-        
-        Demo login:
-        - Regular user: user/password
-        - Admin: admin/adminpass
+        ### About PharmInsight
+        A clinical knowledge base designed for pharmacists.
+
+        * Ask questions about drugs, guidelines, and policies.
+        * Receive evidence-based answers with sources.
+        * Leverages your organization's internal documents.
+
+        ---
+        **Demo Logins:**
+        * Regular user: `user` / `password`
+        * Admin: `admin` / `adminpass`
         """)
 
 def main_page():
     """Render the main search page"""
-    st.title("PharmInsight for Pharmacists")
+    st.title("📚 PharmInsight Search")
     st.markdown("Ask questions related to clinical guidelines, drug information, or policies.")
-    
-    # Check if we have documents and index
-    index, metadata = load_search_index()
-    has_documents = index.ntotal > 0 and metadata
-    
+
+    # Check if OpenAI API key is set and valid
+    client = get_openai_client()
+    if not client:
+         st.error("🚨 Configuration Error: OpenAI API key is missing or invalid. Please check settings. Search functionality is disabled.")
+         # Optionally display admin contact info
+         return # Stop rendering the rest of the page if API key is bad
+
+    # Check if we have a usable index
+    index, metadata = load_search_index() # load_search_index now provides feedback in sidebar
+    has_documents = index is not None and index.ntotal > 0 and metadata is not None and len(metadata) > 0
+
     if not has_documents:
-        st.warning("⚠️ No documents are currently available in the system. Please contact an administrator.")
-        
-        # Check if OpenAI API key is set
-        if not st.session_state.get("openai_api_key") and not os.getenv("OPENAI_API_KEY"):
-            st.error("OpenAI API key is not set. Please set it in your environment or settings.")
-        
-        # Debug button to check database
-        if st.button("Debug: Check Document Database"):
-            conn = sqlite3.connect(DB_PATH, timeout=20.0)
-            c = conn.cursor()
-            
-            c.execute("SELECT COUNT(*) FROM documents")
-            doc_count = c.fetchone()[0]
-            
-            c.execute("SELECT COUNT(*) FROM chunks")
-            chunk_count = c.fetchone()[0]
-            
-            st.info(f"Documents in database: {doc_count}, Chunks in database: {chunk_count}")
-            
-            if doc_count > 0 and chunk_count == 0:
-                st.error("Documents exist but no chunks were created. Check the document processing logic.")
-            elif doc_count == 0:
-                st.error("No documents in the database. Try uploading some documents first.")
-            
-            conn.close()
-        
-    # Search interface
-    query = st.text_input("Ask a clinical question", placeholder="e.g., What is the recommended monitoring plan for amiodarone?")
-    
-    # Recent searches suggestions
+        st.warning("⚠️ No documents are currently indexed in the system. Search may not return results. Please contact an administrator or upload documents via the Admin Panel.")
+        # Allow searching anyway, but manage expectations
+
+    # --- Search Input Area ---
+    # Use a form to handle query submission and clearing better
+    with st.form(key="search_form"):
+        query = st.text_input(
+            "Ask a clinical question:",
+            placeholder="e.g., What is the recommended monitoring for amiodarone?",
+            key="query_input"
+        )
+        search_col, clear_col = st.columns([4, 1])
+        with search_col:
+             search_submitted = st.form_submit_button("Search", type="primary", use_container_width=True, disabled=not query)
+        with clear_col:
+             clear_submitted = st.form_submit_button("Clear", use_container_width=True)
+
+        if clear_submitted:
+             # Clear the input field by resetting its key in session state
+             st.session_state.query_input = ""
+             # Clear any previous results display area (if managed by state)
+             if 'last_search_result' in st.session_state:
+                 del st.session_state['last_search_result']
+             st.rerun() # Rerun to clear the text input
+
+        if search_submitted and query:
+            # Store query for potential re-use or history display
+            st.session_state["current_query"] = query
+            # Trigger processing below the form
+
+    # --- Display Recent Searches (Optional) ---
     if "user_history" in st.session_state and st.session_state["user_history"]:
-        recent_searches = [h["query"] for h in st.session_state["user_history"][-3:]]
+        recent_searches = list(reversed([h["query"] for h in st.session_state["user_history"]]))[:3] # Get last 3 unique might be better
         if recent_searches:
             st.caption("Recent searches:")
             cols = st.columns(len(recent_searches))
-            for i, col in enumerate(cols):
-                with col:
-                    if st.button(recent_searches[i], key=f"recent_{i}"):
-                        query = recent_searches[i]
-                        st.session_state["current_query"] = query
-                        st.rerun()
-    
-    # Check for a query from session state
-    if "current_query" in st.session_state:
-        query = st.session_state["current_query"]
-        del st.session_state["current_query"]
-    
-    # Submit button
-    search_col, clear_col = st.columns([5, 1])
-    with search_col:
-        search_clicked = st.button("Search", type="primary", disabled=not query, use_container_width=True)
-    with clear_col:
-        clear_clicked = st.button("Clear", use_container_width=True)
-        if clear_clicked:
-            query = ""
-            
-    # Process search
-    if search_clicked and query:
-        with st.spinner("Searching documents and generating answer..."):
-            # Get model settings from sidebar
+            for i, recent_q in enumerate(recent_searches):
+                with cols[i]:
+                    if st.button(f"'{recent_q[:30]}...'" if len(recent_q) > 30 else f"'{recent_q}'", key=f"recent_{i}", help=f"Search again for: {recent_q}"):
+                        # Set query_input and trigger form submission logic via rerun
+                        st.session_state.query_input = recent_q
+                        st.session_state["current_query"] = recent_q # Ensure current_query is set
+                        st.rerun() # Rerun will process the query below
+
+    # --- Process Search and Display Results ---
+    # Check if a search was triggered (either by button or recent search click)
+    if st.session_state.get("current_query"):
+        current_query = st.session_state["current_query"]
+        # Clear the trigger state after processing once
+        st.session_state["current_query"] = None
+
+        st.markdown("---") # Separator
+        with st.spinner("🧠 Searching documents and generating answer..."):
+            # Get model settings from session state
             llm_model = st.session_state.get("llm_model", "gpt-3.5-turbo")
             include_explanation = st.session_state.get("include_explanation", True)
             temperature = st.session_state.get("temperature", 0.2)
-            
+
             # Generate answer
-            result = generate_answer(
-                query, 
-                model=llm_model, 
+            result_data = generate_answer(
+                current_query,
+                model=llm_model,
                 include_explanation=include_explanation,
                 temp=temperature
             )
-        
-        # Display answer
-        if result:
-            if result["source_type"] == "Retrieved Documents":
-                st.success("Answer based on the provided documents:")
-            elif result["source_type"] == "No Relevant Documents":
-                st.warning("No matching information found in the documents.")
-            else:
-                st.error("Error generating answer.")
-                
-            st.markdown(result["answer"])
-            
-            # Add feedback UI for this answer
-            feedback_ui(result["question_id"])
-            
-            # Display sources if available
-            if result["sources"]:
-                with st.expander("📄 Sources Used", expanded=True):
-                    for idx, doc in enumerate(result["sources"]):
-                        score = doc.get("score", 0)
-                        score_percent = int(score * 100) if score <= 1 else int(score)
-                        
-                        st.markdown(f"**Source {idx+1}: {doc['source']} (Relevance: {score_percent}%)**")
-                        
-                        # Display a snippet of the text
-                        text_snippet = doc["text"]
-                        if len(text_snippet) > 300:
-                            text_snippet = text_snippet[:300] + "..."
-                        
-                        st.markdown(f"""
-                        <div style="padding: 10px; border: 1px solid #f0f0f0; border-radius: 5px; 
-                                  margin-bottom: 10px; background-color: #fafafa;">
-                            {text_snippet}
-                        </div>
-                        """, unsafe_allow_html=True)
+            # Store result in session state to persist across reruns if needed
+            st.session_state['last_search_result'] = result_data
+
+    # Display the result if it exists in session state
+    if 'last_search_result' in st.session_state:
+        result_data = st.session_state['last_search_result']
+        st.subheader(f"Results for: \"{result_data['query']}\"")
+
+        # Display status message based on how the answer was generated
+        source_type = result_data.get("source_type", "Error")
+        if source_type == "Retrieved Documents":
+            st.success("✅ Answer generated based on the retrieved documents:")
+        elif source_type == "No Relevant Documents":
+            st.warning("⚠️ No matching information found in the documents.")
+        elif source_type == "Error":
+             st.error("❌ An error occurred while processing your request.")
+        else: # Fallback for unexpected source_type
+             st.info("Displaying generated response:")
+
+
+        # Display the main answer content
+        st.markdown(result_data.get("answer", "No answer generated."))
+
+        # Display sources if available and relevant
+        if source_type == "Retrieved Documents" and result_data.get("sources"):
+            with st.expander("📄 Sources Used", expanded=False): # Start collapsed
+                for idx, doc in enumerate(result_data["sources"]):
+                    score = doc.get("score", 0.0)
+                    score_percent = int(score * 100)
+                    source_name = doc.get('source', 'Unknown Source')
+                    category = doc.get('category', 'N/A')
+                    text_snippet = doc.get("text", "")
+                    if len(text_snippet) > 250: # Shorter snippet
+                        text_snippet = text_snippet[:250] + "..."
+
+                    st.markdown(f"**Source {idx+1}: {source_name}** (Category: {category}, Relevance: {score_percent}%)")
+                    # Use a blockquote or styled div for the snippet
+                    st.markdown(f"> {text_snippet}")
+                    st.markdown("---") # Separator between sources
+
+        # Display feedback UI only if an answer was generated (not on error/no results)
+        if source_type != "Error" and result_data.get("question_id"):
+             feedback_ui(result_data["question_id"])
+
 
 def profile_page():
     """Render the user profile page"""
-    st.header("Your Profile")
-    
+    st.header(f"👤 Profile: {st.session_state.get('username', '')}")
+
+    conn = None
     try:
-        # Get user data
         conn = sqlite3.connect(DB_PATH, timeout=20.0)
         c = conn.cursor()
-        
+
+        # Get user data
         c.execute("""
         SELECT username, role, email, full_name, created_at, last_login
         FROM users WHERE username = ?
         """, (st.session_state["username"],))
-        
         user_data = c.fetchone()
-        
+
         if not user_data:
-            st.error("User data not found")
+            st.error("User data not found.")
             return
-            
-        username, role, email, full_name, created_at, last_login = user_data
-        
+
+        # Unpack user data
+        username, role, email, full_name, created_at_raw, last_login_raw = user_data
+
+        # Format dates nicely
+        created_at = pd.to_datetime(created_at_raw).strftime('%Y-%m-%d %H:%M') if created_at_raw else 'Unknown'
+        last_login = pd.to_datetime(last_login_raw).strftime('%Y-%m-%d %H:%M') if last_login_raw else 'Never'
+
         # Get user activity statistics
-        questions_df = pd.read_sql_query(
-            "SELECT COUNT(*) as count FROM qa_pairs WHERE user_id = ?",
-            conn, params=(username,)
-        )
-        question_count = questions_df['count'].iloc[0]
-        
-        feedback_df = pd.read_sql_query(
-            "SELECT COUNT(*) as count FROM feedback WHERE user_id = ?", 
-            conn, params=(username,)
-        )
-        feedback_count = feedback_df['count'].iloc[0]
-        
-        recent_searches = pd.read_sql_query(
-            """
-            SELECT query, timestamp 
-            FROM search_history 
-            WHERE user_id = ? 
-            ORDER BY timestamp DESC
-            LIMIT 5
-            """, 
-            conn, params=(username,)
-        )
-        
-        conn.close()
-        
-        col1, col2 = st.columns([2, 1])
-        
+        c.execute("SELECT COUNT(*) FROM qa_pairs WHERE user_id = ?", (username,))
+        question_count = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM feedback WHERE user_id = ?", (username,))
+        feedback_count = c.fetchone()[0]
+
+        c.execute("SELECT COUNT(*) FROM search_history WHERE user_id = ?", (username,))
+        search_count = c.fetchone()[0]
+
+
+        # --- Display Profile Information ---
+        col1, col2 = st.columns([2, 1]) # Left wider for info/forms
+
         with col1:
             st.subheader("Account Information")
-            st.write(f"**Username:** {username}")
-            st.write(f"**Role:** {role}")
-            st.write(f"**Email:** {email or 'Not set'}")
-            st.write(f"**Full Name:** {full_name or 'Not set'}")
-            st.write(f"**Account Created:** {created_at[:10] if created_at else 'Unknown'}")
-            st.write(f"**Last Login:** {last_login[:10] if last_login else 'First login'}")
-            
+            st.text_input("Username", value=username, disabled=True)
+            st.text_input("Role", value=role, disabled=True)
+            st.text_input("Account Created", value=created_at, disabled=True)
+            st.text_input("Last Login", value=last_login, disabled=True)
+
             st.divider()
+
+            # --- Update Profile Form ---
             st.subheader("Update Profile")
-            
-            new_email = st.text_input("Email", value=email or "")
-            new_name = st.text_input("Full Name", value=full_name or "")
-            
-            if st.button("Update Profile"):
-                try:
-                    conn = sqlite3.connect(DB_PATH, timeout=20.0)
-                    c = conn.cursor()
-                    
-                    c.execute(
-                        "UPDATE users SET email = ?, full_name = ? WHERE username = ?",
-                        (new_email, new_name, username)
-                    )
-                    conn.commit()
-                    conn.close()
-                    
-                    log_action(username, "update_profile", "Updated user profile")
-                    st.success("Profile updated successfully")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error updating profile: {str(e)}")
-                
+            with st.form("update_profile_form"):
+                new_email = st.text_input("Email", value=email or "")
+                new_name = st.text_input("Full Name", value=full_name or "")
+                update_submitted = st.form_submit_button("Update Profile")
+
+                if update_submitted:
+                    try:
+                        # Use a separate connection context for update
+                        with sqlite3.connect(DB_PATH, timeout=20.0) as update_conn:
+                            uc = update_conn.cursor()
+                            uc.execute(
+                                "UPDATE users SET email = ?, full_name = ? WHERE username = ?",
+                                (new_email, new_name, username)
+                            )
+                            update_conn.commit()
+                        log_action(username, "update_profile", f"Updated profile. Email: {new_email}, Name: {new_name}")
+                        st.success("Profile updated successfully!")
+                        st.rerun() # Rerun to reflect changes
+                    except sqlite3.IntegrityError:
+                         st.error("❌ Error: Email address might already be in use by another account.")
+                    except Exception as e:
+                        st.error(f"❌ Error updating profile: {str(e)}")
+                        print(f"Profile update error for {username}: {e}")
+
+
             st.divider()
+
+            # --- Change Password Form ---
             st.subheader("Change Password")
-            
-            current_pwd = st.text_input("Current Password", type="password")
-            new_pwd = st.text_input("New Password", type="password")
-            confirm_pwd = st.text_input("Confirm New Password", type="password")
-            
-            if st.button("Change Password"):
-                if not current_pwd or not new_pwd or not confirm_pwd:
-                    st.error("All password fields are required")
-                    return
-                    
-                if new_pwd != confirm_pwd:
-                    st.error("New passwords don't match")
-                    return
-                    
-                # Verify current password
-                calculated_hash = hashlib.sha256(f"{current_pwd}:salt_key".encode()).hexdigest()
-                
-                try:
-                    conn = sqlite3.connect(DB_PATH, timeout=20.0)
-                    c = conn.cursor()
-                    
-                    c.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
-                    stored_hash = c.fetchone()[0]
-                    
-                    if stored_hash != calculated_hash:
-                        st.error("Current password is incorrect")
-                        conn.close()
-                        return
-                    
-                    # Update password
-                    new_hash = hashlib.sha256(f"{new_pwd}:salt_key".encode()).hexdigest()
-                    c.execute(
-                        "UPDATE users SET password_hash = ? WHERE username = ?",
-                        (new_hash, username)
-                    )
-                    conn.commit()
-                    conn.close()
-                    
-                    log_action(username, "change_password", "User changed their password")
-                    st.success("Password changed successfully")
-                except Exception as e:
-                    st.error(f"Error changing password: {str(e)}")
-        
+            with st.form("change_password_form"):
+                current_pwd = st.text_input("Current Password", type="password")
+                new_pwd = st.text_input("New Password", type="password")
+                confirm_pwd = st.text_input("Confirm New Password", type="password")
+                pwd_submitted = st.form_submit_button("Change Password")
+
+                if pwd_submitted:
+                    if not current_pwd or not new_pwd or not confirm_pwd:
+                        st.error("All password fields are required.")
+                    elif new_pwd != confirm_pwd:
+                        st.error("New passwords do not match.")
+                    elif len(new_pwd) < 6:
+                         st.error("New password must be at least 6 characters long.")
+                    else:
+                        # Verify current password first (using the verify function for consistency)
+                        verified, _ = verify_password(username, current_pwd)
+                        if not verified:
+                             # verify_password already logs the failed attempt
+                             st.error("Incorrect current password.")
+                        else:
+                            # Hash new password
+                            salt = "salt_key" # Ensure this matches
+                            new_hash = hashlib.sha256(f"{new_pwd}:{salt}".encode()).hexdigest()
+                            try:
+                                # Use a separate connection context
+                                with sqlite3.connect(DB_PATH, timeout=20.0) as pwd_conn:
+                                    pc = pwd_conn.cursor()
+                                    pc.execute(
+                                        "UPDATE users SET password_hash = ? WHERE username = ?",
+                                        (new_hash, username)
+                                    )
+                                    pwd_conn.commit()
+                                log_action(username, "change_password", "User changed their password successfully.")
+                                st.success("Password changed successfully!")
+                                # Optionally clear form fields after success
+                            except Exception as e:
+                                st.error(f"❌ Error changing password: {str(e)}")
+                                print(f"Password change error for {username}: {e}")
+
         with col2:
+            # --- Display Activity Stats ---
             st.subheader("Your Activity")
-            
             st.metric("Questions Asked", question_count)
+            st.metric("Searches Made", search_count)
             st.metric("Feedback Given", feedback_count)
-            
+
+            st.divider()
+
+            # --- Recent Searches (Profile Page) ---
             st.subheader("Recent Searches")
-            if not recent_searches.empty:
-                for _, row in recent_searches.iterrows():
-                    formatted_time = row['timestamp'][:10] if row['timestamp'] else ""
-                    st.write(f"• {row['query']} ({formatted_time})")
+            recent_searches_df = pd.read_sql_query(
+                """
+                SELECT query, timestamp
+                FROM search_history
+                WHERE user_id = ?
+                ORDER BY timestamp DESC
+                LIMIT 5
+                """,
+                conn, params=(username,)
+            )
+
+            if not recent_searches_df.empty:
+                for _, row in recent_searches_df.iterrows():
+                    ts = pd.to_datetime(row['timestamp']).strftime('%Y-%m-%d %H:%M')
+                    q_short = row['query'][:40] + '...' if len(row['query']) > 40 else row['query']
+                    st.markdown(f"* `{ts}`: {q_short}")
             else:
-                st.write("No recent searches")
-                
+                st.info("No recent searches found.")
+
     except Exception as e:
-        st.error(f"Error loading profile: {str(e)}")
+        st.error(f"❌ Error loading profile page: {str(e)}")
+        print(f"Profile page load error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
 
 def history_page():
     """Render search history page"""
-    st.title("Your Search History")
-    
+    st.title("📜 Your Activity History")
+    username = st.session_state.get("username", "unknown_user")
+
     try:
-        # Get search history
         conn = sqlite3.connect(DB_PATH, timeout=20.0)
-        
+
+        # --- Fetch Data ---
         history_df = pd.read_sql_query(
             """
-            SELECT query, timestamp, num_results
+            SELECT history_id, query, timestamp, num_results
             FROM search_history
             WHERE user_id = ?
             ORDER BY timestamp DESC
-            LIMIT 50
+            LIMIT 100 -- Limit history display
             """,
-            conn,
-            params=(st.session_state["username"],)
+            conn, params=(username,)
         )
-        
-        # Get answered questions
+
         qa_df = pd.read_sql_query(
             """
-            SELECT question_id, query, timestamp
+            SELECT question_id, query, answer, timestamp, sources, model_used
             FROM qa_pairs
             WHERE user_id = ?
             ORDER BY timestamp DESC
-            LIMIT 50
+            LIMIT 100 -- Limit display
             """,
-            conn,
-            params=(st.session_state["username"],)
+            conn, params=(username,)
         )
-        
-        conn.close()
-        
-        # Display history
-        tab1, tab2 = st.tabs(["🔍 Search History", "❓ Questions Asked"])
-        
+
+        feedback_df = pd.read_sql_query(
+             """
+             SELECT f.rating, f.comment, f.timestamp, q.query as original_query
+             FROM feedback f
+             JOIN qa_pairs q ON f.question_id = q.question_id
+             WHERE f.user_id = ?
+             ORDER BY f.timestamp DESC
+             LIMIT 100 -- Limit display
+             """,
+             conn, params=(username,)
+        )
+
+        # --- Display in Tabs ---
+        tab1, tab2, tab3 = st.tabs(["🔍 Search History", "❓ Questions & Answers", "📊 Feedback Given"])
+
         with tab1:
+            st.subheader("Your Recent Searches")
             if history_df.empty:
-                st.info("You haven't made any searches yet.")
+                st.info("You haven't performed any searches yet.")
             else:
-                col1, col2 = st.columns([5, 1])
-                
-                with col1:
-                    st.write(f"Showing your last {len(history_df)} searches")
-                
-                with col2:
-                    if st.button("Clear History"):
-                        try:
-                            conn = sqlite3.connect(DB_PATH, timeout=20.0)
-                            c = conn.cursor()
-                            
-                            c.execute(
-                                "DELETE FROM search_history WHERE user_id = ?",
-                                (st.session_state["username"],)
-                            )
-                            
-                            conn.commit()
-                            conn.close()
-                            
-                            log_action(
-                                st.session_state["username"],
-                                "clear_history",
-                                "User cleared search history"
-                            )
-                            
-                            st.session_state["user_history"] = []
-                            st.success("Search history cleared")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Error clearing history: {str(e)}")
-                
-                # Display history items
+                # Option to clear history
+                if st.button("Clear Search History", key="clear_hist_btn"):
+                     try:
+                          with sqlite3.connect(DB_PATH, timeout=20.0) as clear_conn:
+                               cc = clear_conn.cursor()
+                               cc.execute("DELETE FROM search_history WHERE user_id = ?", (username,))
+                               clear_conn.commit()
+                          log_action(username, "clear_history", "User cleared their search history.")
+                          st.session_state["user_history"] = [] # Clear session state too
+                          st.success("Search history cleared.")
+                          st.rerun()
+                     except Exception as e:
+                          st.error(f"Error clearing history: {e}")
+
+                st.write(f"Showing your last {len(history_df)} searches:")
                 for i, row in history_df.iterrows():
                     with st.container():
-                        col1, col2 = st.columns([4, 1])
+                        col1, col2, col3 = st.columns([4, 2, 1])
                         with col1:
-                            st.write(f"**{row['query']}**")
-                            # Format timestamp for display
-                            timestamp = row['timestamp']
-                            if timestamp:
-                                formatted_time = timestamp[:19].replace('T', ' ') if 'T' in timestamp else timestamp[:16]
-                                st.caption(f"{formatted_time}")
-                            # Show if search had results
-                            if 'num_results' in row and row['num_results'] > 0:
-                                st.caption(f"Found {row['num_results']} results")
-                            else:
-                                st.caption("No results found")
+                             st.markdown(f"**Query:** `{row['query']}`")
                         with col2:
-                            if st.button("Search Again", key=f"again_{i}"):
-                                st.session_state["current_query"] = row['query']
-                                st.session_state["page"] = "main"
-                                st.rerun()
+                             ts = pd.to_datetime(row['timestamp']).strftime('%Y-%m-%d %H:%M')
+                             results_text = f"({row['num_results']} results)" if row['num_results'] is not None else "(Results N/A)"
+                             st.caption(f"{ts} {results_text}")
+                        with col3:
+                             if st.button("Search Again", key=f"again_{row['history_id']}"):
+                                 st.session_state["query_input"] = row['query'] # Pre-fill input
+                                 st.session_state["current_query"] = row['query'] # Set trigger
+                                 st.session_state["page"] = "main"
+                                 st.rerun()
                         st.divider()
-        
+
         with tab2:
-            if qa_df.empty:
-                st.info("You haven't asked any questions yet.")
-            else:
-                st.write(f"Showing your last {len(qa_df)} questions")
-                
-                # Display questions
-                for i, row in qa_df.iterrows():
-                    with st.container():
-                        col1, col2 = st.columns([4, 1])
-                        with col1:
-                            st.write(f"**{row['query']}**")
-                            # Format timestamp for display
-                            timestamp = row['timestamp']
-                            if timestamp:
-                                formatted_time = timestamp[:19].replace('T', ' ') if 'T' in timestamp else timestamp[:16]
-                                st.caption(f"{formatted_time}")
-                        with col2:
-                            if st.button("View Answer", key=f"view_{i}"):
-                                # This would normally link to the answer, but for now just search again
+             st.subheader("Your Recent Questions & Answers")
+             if qa_df.empty:
+                  st.info("You haven't asked any questions that resulted in an answer yet.")
+             else:
+                  st.write(f"Showing your last {len(qa_df)} answered questions:")
+                  for i, row in qa_df.iterrows():
+                       with st.expander(f"Q: {row['query'][:80]}... ({pd.to_datetime(row['timestamp']).strftime('%Y-%m-%d %H:%M')})"):
+                            st.markdown("**Answer:**")
+                            st.markdown(row['answer'])
+                            st.caption(f"Model: {row['model_used']} | Sources: {row['sources']}")
+                            # Add button to ask again?
+                            if st.button("Ask Again", key=f"ask_again_{row['question_id']}"):
+                                st.session_state["query_input"] = row['query']
                                 st.session_state["current_query"] = row['query']
                                 st.session_state["page"] = "main"
                                 st.rerun()
-                        st.divider()
-                
+
+
+        with tab3:
+             st.subheader("Feedback You've Given")
+             if feedback_df.empty:
+                  st.info("You haven't submitted any feedback yet.")
+             else:
+                  st.write(f"Showing your last {len(feedback_df)} feedback entries:")
+                  rating_labels = {1: "Not Helpful", 2: "Somewhat Helpful", 3: "Very Helpful"}
+                  for i, row in feedback_df.iterrows():
+                       with st.container():
+                            st.markdown(f"**Rating:** {rating_labels.get(row['rating'], 'Unknown')} ({row['rating']}/3)")
+                            if row['comment']:
+                                 st.markdown(f"**Comment:** {row['comment']}")
+                            st.caption(f"For query: '{row['original_query'][:60]}...' | On: {pd.to_datetime(row['timestamp']).strftime('%Y-%m-%d %H:%M')}")
+                            st.divider()
+
     except Exception as e:
-        st.error(f"Error loading search history: {str(e)}")
+        st.error(f"❌ Error loading history page: {str(e)}")
+        print(f"History page load error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+
+# --- Admin Pages ---
 
 def admin_docs_page():
     """Admin document management page"""
     if not is_admin():
-        st.warning("Admin access required")
+        st.warning("⛔ Admin access required for this page.")
         return
-        
-    st.title("Document Management")
-    
+
+    st.title("📄 Document Management")
+
     # Create tabs for different functions
-    tab1, tab2, tab3 = st.tabs(["📄 Documents List", "⬆️ Upload Documents", "🔄 Rebuild Index"])
-    
-    # Tab 1: Documents List
-    with tab1:
-        st.subheader("All Documents")
-        
-        # Get all documents
-        try:
-            conn = sqlite3.connect(DB_PATH, timeout=20.0)
-            
-            # First check if documents table has any records
-            c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM documents")
-            total_docs = c.fetchone()[0]
-            st.info(f"Total documents in database: {total_docs}")
-            
-            # Then get the documents with user information
+    tab1, tab2, tab3 = st.tabs(["Documents List", "Upload Documents", "Rebuild Index"])
+
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30.0) # Longer timeout for potential rebuilds
+
+        # --- Tab 1: Documents List ---
+        with tab1:
+            st.subheader("All Documents")
+
             docs_df = pd.read_sql_query(
                 """
                 SELECT d.doc_id, d.filename, d.category, d.upload_date, d.is_active,
-                       u.username as uploader, COUNT(c.chunk_id) as chunks
+                       d.uploader, COUNT(c.chunk_id) as chunks
                 FROM documents d
-                JOIN users u ON d.uploader = u.username
                 LEFT JOIN chunks c ON d.doc_id = c.doc_id
                 GROUP BY d.doc_id
                 ORDER BY d.upload_date DESC
-                """,
-                conn
+                """, conn
             )
-            
-            # Check for documents without users
-            c.execute("""
-                SELECT COUNT(*) 
-                FROM documents d 
-                LEFT JOIN users u ON d.uploader = u.username 
-                WHERE u.username IS NULL
-            """)
-            orphaned_docs = c.fetchone()[0]
-            if orphaned_docs > 0:
-                st.warning(f"Found {orphaned_docs} documents without valid users")
-            
-            conn.close()
-            
+
             if docs_df.empty:
-                st.info("No documents in the system yet.")
-                
-                # Add debug button
-                if st.button("Debug: Check Database"):
-                    conn = sqlite3.connect(DB_PATH, timeout=20.0)
-                    c = conn.cursor()
-                    
-                    # Check all documents
-                    c.execute("SELECT doc_id, filename, uploader FROM documents")
-                    all_docs = c.fetchall()
-                    st.write("All documents in database:")
-                    for doc in all_docs:
-                        st.write(f"- {doc[1]} (ID: {doc[0]}, Uploader: {doc[2]})")
-                    
-                    # Check chunks
-                    c.execute("SELECT COUNT(*) FROM chunks")
-                    chunk_count = c.fetchone()[0]
-                    st.write(f"Total chunks in database: {chunk_count}")
-                    
-                    # Check users
-                    c.execute("SELECT username FROM users")
-                    users = [row[0] for row in c.fetchall()]
-                    st.write(f"Users in database: {users}")
-                    
-                    conn.close()
+                st.info("No documents found in the system.")
             else:
-                # Format the status column
+                # Format data for display
+                docs_df['upload_date'] = pd.to_datetime(docs_df['upload_date']).dt.strftime('%Y-%m-%d %H:%M')
                 docs_df['status'] = docs_df['is_active'].apply(lambda x: "✅ Active" if x else "❌ Inactive")
-                
-                # Display as a dataframe with action buttons
+
+                # Display DataFrame
                 st.dataframe(
                     docs_df[['filename', 'category', 'upload_date', 'uploader', 'chunks', 'status']],
-                    column_config={
-                        "upload_date": st.column_config.DatetimeColumn(
-                            "Upload Date",
-                            format="YYYY-MM-DD HH:mm"
-                        )
+                    use_container_width=True,
+                     column_config={
+                        "upload_date": st.column_config.TextColumn("Uploaded"),
+                        "chunks": st.column_config.NumberColumn("Chunks", format="%d")
                     }
                 )
-                
-                # Document details and actions
-                st.subheader("Document Details")
-                
-                if not docs_df.empty:
-                    selected_doc_id = st.selectbox(
-                        "Select a document",
-                        docs_df['doc_id'].tolist(),
-                        format_func=lambda x: docs_df.loc[docs_df['doc_id'] == x, 'filename'].iloc[0]
-                    )
-                    
-                    if selected_doc_id:
-                        # Get document details
-                        conn = sqlite3.connect(DB_PATH, timeout=20.0)
-                        doc_df = pd.read_sql_query(
-                            """
-                            SELECT d.*, u.username as uploader_name
-                            FROM documents d
-                            JOIN users u ON d.uploader = u.username
-                            WHERE d.doc_id = ?
-                            """,
-                            conn,
-                            params=(selected_doc_id,)
-                        )
-                        
-                        # Get chunks
-                        chunks_df = pd.read_sql_query(
-                            "SELECT chunk_id, text FROM chunks WHERE doc_id = ?",
-                            conn,
-                            params=(selected_doc_id,)
-                        )
-                        
-                        conn.close()
-                        
-                        if not doc_df.empty:
-                            doc_info = doc_df.iloc[0].to_dict()
-                            
-                            col1, col2, col3 = st.columns(3)
-                            
-                            with col1:
-                                st.write(f"**Filename:** {doc_info['filename']}")
-                                st.write(f"**Category:** {doc_info['category']}")
-                                st.write(f"**Upload Date:** {doc_info['upload_date'][:10]}")
-                                
-                            with col2:
-                                st.write(f"**Uploaded by:** {doc_info['uploader_name']}")
-                                st.write(f"**Status:** {'Active' if doc_info['is_active'] else 'Inactive'}")
-                                st.write(f"**Chunks:** {len(chunks_df) if not chunks_df.empty else 0}")
-                                
-                            with col3:
-                                is_active = bool(doc_info['is_active'])
-                                if is_active:
-                                    if st.button("Deactivate Document"):
-                                        try:
-                                            conn = sqlite3.connect(DB_PATH, timeout=20.0)
-                                            c = conn.cursor()
-                                            c.execute(
-                                                "UPDATE documents SET is_active = ? WHERE doc_id = ?",
-                                                (0, selected_doc_id)
-                                            )
-                                            conn.commit()
-                                            conn.close()
-                                            
-                                            status_str = "deactivated"
-                                            log_action(
-                                                st.session_state["username"],
-                                                f"document_{status_str}",
-                                                f"Document {selected_doc_id} was {status_str}"
-                                            )
-                                            
-                                            st.success("Document deactivated")
-                                            st.rerun()
-                                        except Exception as e:
-                                            st.error(f"Error deactivating document: {str(e)}")
-                                else:
-                                    if st.button("Activate Document"):
-                                        try:
-                                            conn = sqlite3.connect(DB_PATH, timeout=20.0)
-                                            c = conn.cursor()
-                                            c.execute(
-                                                "UPDATE documents SET is_active = ? WHERE doc_id = ?",
-                                                (1, selected_doc_id)
-                                            )
-                                            conn.commit()
-                                            conn.close()
-                                            
-                                            status_str = "activated"
-                                            log_action(
-                                                st.session_state["username"],
-                                                f"document_{status_str}",
-                                                f"Document {selected_doc_id} was {status_str}"
-                                            )
-                                            
-                                            st.success("Document activated")
-                                            st.rerun()
-                                        except Exception as e:
-                                            st.error(f"Error activating document: {str(e)}")
-                                            
-                                if st.button("Delete Document", type="primary"):
-                                    confirm = st.checkbox("Confirm deletion?")
-                                    if confirm:
-                                        try:
-                                            conn = sqlite3.connect(DB_PATH, timeout=20.0)
-                                            c = conn.cursor()
-                                            
-                                            # Get filename first for logging
-                                            c.execute("SELECT filename FROM documents WHERE doc_id = ?", (selected_doc_id,))
-                                            result = c.fetchone()
-                                            filename = result[0] if result else "unknown"
-                                            
-                                            # Delete chunks first (foreign key constraint)
-                                            c.execute("DELETE FROM chunks WHERE doc_id = ?", (selected_doc_id,))
-                                            
-                                            # Delete the document
-                                            c.execute("DELETE FROM documents WHERE doc_id = ?", (selected_doc_id,))
-                                            
-                                            conn.commit()
-                                            conn.close()
-                                            
-                                            log_action(
-                                                st.session_state["username"],
-                                                "delete_document",
-                                                f"Deleted document: {filename}, ID: {selected_doc_id}"
-                                            )
-                                            
-                                            st.success("Document deleted successfully")
-                                            st.rerun()
-                                        except Exception as e:
-                                            st.error(f"Error deleting document: {str(e)}")
-                            
-                            # Show document chunks
-                            if not chunks_df.empty:
-                                with st.expander("View Document Chunks"):
-                                    for i, row in chunks_df.iterrows():
-                                        st.markdown(f"**Chunk {i+1}**")
-                                        st.text_area(
-                                            f"Text for chunk {i+1}",
-                                            value=row['text'],
-                                            height=150,
-                                            key=f"chunk_{row['chunk_id']}",
-                                            disabled=True
-                                        )
-                                        st.divider()
-        except Exception as e:
-            st.error(f"Error processing documents: {str(e)}")
-    
-    # Tab 2: Upload Documents
-    with tab2:
-        st.subheader("Upload New Documents")
-        
-        uploaded_files = st.file_uploader(
-            "Upload documents (PDF or text files)", 
-            accept_multiple_files=True,
-            type=["pdf", "txt"]
-        )
-        
-        if uploaded_files:
-            # Meta-information for uploads
-            with st.expander("Document Information", expanded=True):
-                category = st.selectbox(
-                    "Document Category",
-                    ["Clinical Guidelines", "Drug Information", "Policy", "Protocol", "Research", "Educational", "Other"],
-                    index=0
+
+                st.divider()
+                st.subheader("Document Actions")
+
+                # Select document for actions
+                doc_options = {row['doc_id']: f"{row['filename']} ({row['status']})" for _, row in docs_df.iterrows()}
+                selected_doc_id = st.selectbox(
+                    "Select document for actions:",
+                    options=list(doc_options.keys()),
+                    format_func=lambda x: doc_options.get(x, "Unknown Document")
                 )
-                
-                description = st.text_area("Description (optional)")
-                expiry_date = st.date_input("Expiry Date (if applicable)", value=None)
-                
-            # Processing options
-            with st.expander("Processing Options", expanded=True):
-                chunk_size = st.slider("Chunk Size (characters)", 500, 2000, 1000, 100)
-                chunk_overlap = st.slider("Chunk Overlap (characters)", 50, 500, 200, 50)
-                st.info("A smaller chunk size and larger overlap may improve search quality but increases processing time and storage requirements.")
-            
-            # Debug option for document processing
-            debug_mode = st.checkbox("Enable debug mode", value=True)
-            
-            # Process files
-            if st.button("Process and Upload", type="primary"):
-                metadata = {
-                    "category": category,
-                    "description": description,
-                    "expiry_date": expiry_date.isoformat() if expiry_date else None,
-                    "chunk_size": chunk_size,
-                    "chunk_overlap": chunk_overlap
-                }
-                
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                for i, file in enumerate(uploaded_files):
-                    status_text.text(f"Processing {file.name} ({i+1}/{len(uploaded_files)})")
-                    progress_bar.progress((i) / len(uploaded_files))
-                    
-                    if debug_mode:
-                        st.write(f"Processing file: {file.name}")
-                        st.write(f"File size: {file.size} bytes")
-                        st.write(f"File type: {file.type}")
-                        
-                        # Extract a sample of the file content
-                        if file.name.lower().endswith(".pdf"):
-                            with st.expander("File Preview"):
-                                st.write("PDF file detected. Attempting text extraction...")
-                                
+
+                if selected_doc_id:
+                    selected_doc_info = docs_df[docs_df['doc_id'] == selected_doc_id].iloc[0]
+                    is_active = bool(selected_doc_info['is_active'])
+                    filename = selected_doc_info['filename']
+
+                    action_col1, action_col2 = st.columns(2)
+
+                    with action_col1:
+                        # Activate/Deactivate Button
+                        if is_active:
+                            if st.button(f"Deactivate '{filename}'", key=f"deact_{selected_doc_id}"):
                                 try:
-                                    from io import BytesIO
-                                    from PyPDF2 import PdfReader
-                                    
-                                    reader = PdfReader(file)
-                                    sample_text = ""
-                                    
-                                    # Extract first page as sample
-                                    if len(reader.pages) > 0:
-                                        sample_text = reader.pages[0].extract_text()
-                                    
-                                    file.seek(0)  # Reset file pointer
-                                    preview = sample_text[:500] + "..." if len(sample_text) > 500 else sample_text
-                                    st.text(preview)
+                                    with sqlite3.connect(DB_PATH, timeout=20.0) as action_conn:
+                                        ac = action_conn.cursor()
+                                        ac.execute("UPDATE documents SET is_active = 0 WHERE doc_id = ?", (selected_doc_id,))
+                                        action_conn.commit()
+                                    log_action(st.session_state['username'], "deactivate_document", f"Deactivated document ID: {selected_doc_id} ({filename})")
+                                    st.success(f"Document '{filename}' deactivated.")
+                                    st.rerun()
                                 except Exception as e:
-                                    st.error(f"Error previewing PDF: {str(e)}")
-                    
-                    try:
-                        # Extract text from file
-                        text = ""
-                        if file.name.lower().endswith(".pdf"):
-                            try:
-                                from io import BytesIO
-                                from PyPDF2 import PdfReader
-                                
-                                # Reset file pointer
-                                file.seek(0)
-                                reader = PdfReader(file)
-                                text = ""
-                                
-                                # Extract text from each page
-                                for page_num, page in enumerate(reader.pages):
-                                    page_text = page.extract_text()
-                                    if page_text:
-                                        text += page_text + "\n\n"
-                                
-                                # Reset file pointer again
-                                file.seek(0)
-                                
-                                # Debug: Show extracted text length
-                                if debug_mode:
-                                    st.write(f"Extracted text length: {len(text)} characters")
-                                
-                            except Exception as e:
-                                st.error(f"Error extracting PDF: {str(e)}")
-                                continue
-                        elif file.name.lower().endswith((".txt", ".csv", ".md")):
-                            try:
-                                text = file.read().decode("utf-8")
-                                file.seek(0)
-                            except UnicodeDecodeError:
-                                # Try other encodings
-                                file.seek(0)
-                                for encoding in ["latin-1", "windows-1252", "iso-8859-1"]:
-                                    try:
-                                        text = file.read().decode(encoding)
-                                        file.seek(0)
-                                        break
-                                    except:
-                                        file.seek(0)
-                                        continue
+                                    st.error(f"Error deactivating document: {e}")
                         else:
-                            st.error(f"Unsupported file type: {file.name}")
-                            continue
-                        
-                        if not text.strip():
-                            st.error(f"No content extracted from {file.name}")
-                            continue
-                        
-                        # Chunk the text
-                        chunks = []
-                        if len(text) < chunk_size:
-                            chunks = [text]
-                        else:
-                            start = 0
-                            text_len = len(text)
-                            
-                            while start < text_len:
-                                end = min(start + chunk_size, text_len)
-                                
-                                if end >= text_len:
-                                    chunks.append(text[start:])
-                                    break
-                                    
-                                # Find semantic boundaries
-                                last_paragraph = text.rfind('\n\n', start + chunk_size // 2, end)
-                                last_period = text.rfind('. ', start + chunk_size // 2, end)
-                                last_newline = text.rfind('\n', start + chunk_size // 2, end)
-                                
-                                # Choose the best break point
-                                if last_paragraph > start:
-                                    break_point = last_paragraph + 2
-                                elif last_period > start:
-                                    break_point = last_period + 1
-                                elif last_newline > start:
-                                    break_point = last_newline + 1
-                                else:
-                                    break_point = end
-                                    
-                                chunk = text[start:break_point].strip()
-                                if chunk:
-                                    chunks.append(chunk)
-                                
-                                start = break_point - chunk_overlap
-                                if start < 0:
-                                    start = 0
-                        
-                        # Store document in database
-                        conn = sqlite3.connect(DB_PATH, timeout=20.0)
-                        c = conn.cursor()
-                        
-                        try:
-                            # Start a transaction
-                            conn.execute("BEGIN TRANSACTION")
-                            
-                            # Create document record
-                            doc_id = str(uuid.uuid4())
-                            c.execute(
-                                "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                                (
-                                    doc_id,
-                                    file.name,
-                                    datetime.datetime.now().isoformat(),
-                                    st.session_state["username"],
-                                    metadata.get("category", "Uncategorized"),
-                                    metadata.get("description", ""),
-                                    metadata.get("expiry_date", ""),
-                                    1  # is_active
-                                )
-                            )
-                            
-                            # Verify document insertion
-                            c.execute("SELECT COUNT(*) FROM documents WHERE doc_id = ?", (doc_id,))
-                            doc_count = c.fetchone()[0]
-                            if doc_count == 0:
-                                raise Exception("Failed to insert document record")
-                            
-                            # Store chunks and generate embeddings
-                            success_count = 0
-                            for i, chunk_text in enumerate(chunks):
-                                if not chunk_text.strip():
-                                    continue
-                                    
-                                chunk_id = f"{doc_id}_{i+1}"
-                                
+                            if st.button(f"Activate '{filename}'", key=f"act_{selected_doc_id}"):
                                 try:
-                                    # Generate embedding
-                                    status_text.text(f"Processing chunk {i+1}/{len(chunks)}")
-                                    chunk_progress = ((i + 1) / len(chunks)) * 0.5 + 0.5
-                                    progress_bar.progress(chunk_progress)
-                                    
-                                    embedding = get_embedding(chunk_text)
-                                    embedding_bytes = pickle.dumps(embedding)
-                                    
-                                    c.execute(
-                                        "INSERT INTO chunks VALUES (?, ?, ?, ?)",
-                                        (chunk_id, doc_id, chunk_text, embedding_bytes)
-                                    )
-                                    success_count += 1
+                                    with sqlite3.connect(DB_PATH, timeout=20.0) as action_conn:
+                                        ac = action_conn.cursor()
+                                        ac.execute("UPDATE documents SET is_active = 1 WHERE doc_id = ?", (selected_doc_id,))
+                                        action_conn.commit()
+                                    log_action(st.session_state['username'], "activate_document", f"Activated document ID: {selected_doc_id} ({filename})")
+                                    st.success(f"Document '{filename}' activated.")
+                                    st.rerun()
                                 except Exception as e:
-                                    st.warning(f"Error processing chunk {i+1}: {str(e)}")
-                                    # Continue with other chunks, don't fail entirely
-                            
-                            if success_count == 0:
-                                raise Exception("No chunks were successfully processed")
-                            
-                            # Commit the transaction
-                            conn.commit()
-                            
-                            # Verify the document was actually saved
-                            c.execute("SELECT COUNT(*) FROM documents WHERE doc_id = ?", (doc_id,))
-                            if c.fetchone()[0] == 0:
-                                raise Exception("Document not found after commit")
-                            
-                            # Verify chunks were saved
-                            c.execute("SELECT COUNT(*) FROM chunks WHERE doc_id = ?", (doc_id,))
-                            chunk_count = c.fetchone()[0]
-                            
-                            log_action(
-                                st.session_state["username"],
-                                "upload_document",
-                                f"Uploaded document: {file.name}, ID: {doc_id}, Chunks: {chunk_count}"
-                            )
-                            
-                            st.success(f"✅ {file.name}: Processed successfully with {chunk_count} chunks")
-                            
-                        except Exception as e:
-                            # Rollback the transaction on error
-                            conn.rollback()
-                            st.error(f"❌ {file.name}: Error saving to database: {str(e)}")
-                        finally:
-                            conn.close()
-                    except Exception as e:
-                        st.error(f"❌ {file.name}: Error processing document: {str(e)}")
-                        
-                progress_bar.progress(1.0)
-                status_text.text("Processing complete")
-                
-                # Rebuild index
-                with st.spinner("Rebuilding search index..."):
-                    success, count = rebuild_index_from_db()
-                    if success:
-                        st.success(f"Search index rebuilt with {count} document chunks")
+                                    st.error(f"Error activating document: {e}")
+
+                    with action_col2:
+                        # Delete Button (with confirmation)
+                        st.error("⚠️ Deleting a document is permanent and removes all associated data.")
+                        if st.checkbox(f"Confirm deletion of '{filename}'?", key=f"del_confirm_{selected_doc_id}"):
+                            if st.button(f"DELETE '{filename}'", type="primary", key=f"del_btn_{selected_doc_id}"):
+                                try:
+                                    with sqlite3.connect(DB_PATH, timeout=20.0) as action_conn:
+                                        # Ensure foreign key support is enabled (usually default, but good practice)
+                                        action_conn.execute("PRAGMA foreign_keys = ON")
+                                        ac = action_conn.cursor()
+                                        # Deleting from documents should cascade delete chunks due to schema
+                                        ac.execute("DELETE FROM documents WHERE doc_id = ?", (selected_doc_id,))
+                                        action_conn.commit()
+                                    log_action(st.session_state['username'], "delete_document", f"Deleted document ID: {selected_doc_id} ({filename})")
+                                    st.success(f"Document '{filename}' and its chunks deleted.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error deleting document: {e}")
+                                    print(f"Delete error for doc {selected_doc_id}: {e}")
+
+
+        # --- Tab 2: Upload Documents ---
+        with tab2:
+            st.subheader("Upload New Documents")
+
+            uploaded_files = st.file_uploader(
+                "Select documents (PDF or TXT)",
+                accept_multiple_files=True,
+                type=["pdf", "txt"]
+            )
+
+            if uploaded_files:
+                # Use a form for metadata and options
+                with st.form("upload_form"):
+                    st.write("--- Document Information ---")
+                    category = st.selectbox(
+                        "Document Category",
+                        ["Clinical Guidelines", "Drug Information", "Policy", "Protocol", "Research", "Educational", "Other"],
+                        index=0
+                    )
+                    description = st.text_area("Description (optional)")
+                    expiry_date = st.date_input("Expiry Date (optional)", value=None)
+
+                    st.write("--- Processing Options ---")
+                    chunk_size = st.slider("Chunk Size (characters)", 500, 3000, 1000, 100)
+                    chunk_overlap = st.slider("Chunk Overlap (characters)", 0, 500, 200, 50)
+                    st.caption("Adjust chunking for optimal search results. Overlap helps maintain context between chunks.")
+
+                    # Debug mode checkbox
+                    debug_mode = st.checkbox("Enable debug output during processing", value=False)
+
+                    upload_submitted = st.form_submit_button("Process and Upload Files", type="primary")
+
+                if upload_submitted:
+                    # Check API key before starting expensive processing
+                    client = get_openai_client()
+                    if not client:
+                         st.error("❌ Cannot process upload: OpenAI API key is missing or invalid.")
                     else:
-                        st.error("Failed to rebuild search index")
-    
-    # Tab 3: Rebuild Index
-    with tab3:
-        st.subheader("Rebuild Search Index")
-        st.markdown("""
-        Rebuilding the search index will update the vector database used for document retrieval.
-        This is useful if documents were added, modified, or removed directly in the database.
-        """)
-        
-        # Check if OpenAI API key is set
-        if not st.session_state.get("openai_api_key") and not os.getenv("OPENAI_API_KEY"):
-            st.error("OpenAI API key is required for rebuilding the index. Please set it in your environment or settings.")
-        else:
-            if st.button("Rebuild Index", type="primary"):
-                with st.spinner("Rebuilding search index..."):
-                    success, count = rebuild_index_from_db()
-                    if success:
-                        st.success(f"Search index rebuilt successfully with {count} document chunks")
-                    else:
-                        st.error("Failed to rebuild search index")
+                        metadata_opts = {
+                            "category": category,
+                            "description": description,
+                            "expiry_date": expiry_date.isoformat() if expiry_date else None,
+                            "chunk_size": chunk_size,
+                            "chunk_overlap": chunk_overlap
+                        }
+
+                        progress_bar_total = st.progress(0)
+                        status_text_total = st.empty()
+                        files_processed = 0
+                        files_failed = 0
+
+                        for i, file in enumerate(uploaded_files):
+                             status_text_total.text(f"Processing file {i+1}/{len(uploaded_files)}: {file.name}")
+                             progress_bar_total.progress((i + 1) / len(uploaded_files))
+
+                             if debug_mode:
+                                 st.write(f"--- Debug: Processing {file.name} ---")
+                                 st.write(f"Size: {file.size} bytes, Type: {file.type}")
+                                 st.write(f"Options: {metadata_opts}")
+
+                             try:
+                                 # --- 1. Extract Text ---
+                                 text = ""
+                                 file.seek(0) # Ensure reading from start
+                                 if file.name.lower().endswith(".pdf"):
+                                     try:
+                                         reader = PdfReader(file)
+                                         if reader.is_encrypted:
+                                             st.error(f"❌ Skipping encrypted PDF: {file.name}")
+                                             files_failed += 1
+                                             continue
+                                         text = "".join(page.extract_text() + "\n\n" for page in reader.pages if page.extract_text())
+                                     except Exception as pdf_err:
+                                         st.error(f"❌ Error reading PDF {file.name}: {pdf_err}")
+                                         files_failed += 1
+                                         continue
+                                 elif file.name.lower().endswith(".txt"):
+                                     try:
+                                         text = file.read().decode("utf-8")
+                                     except UnicodeDecodeError:
+                                         try:
+                                             file.seek(0)
+                                             text = file.read().decode("latin-1") # Try fallback encoding
+                                         except Exception as txt_err:
+                                             st.error(f"❌ Error reading TXT {file.name}: {txt_err}")
+                                             files_failed += 1
+                                             continue
+                                 else:
+                                     st.error(f"❌ Unsupported file type: {file.name}")
+                                     files_failed += 1
+                                     continue
+
+                                 if not text or not text.strip():
+                                     st.warning(f"⚠️ No text extracted from {file.name}. Skipping.")
+                                     files_failed += 1
+                                     continue
+
+                                 if debug_mode:
+                                     st.write(f"Extracted text length: {len(text)}")
+                                     st.text_area("Extracted Text Sample", text[:500]+"...", height=100, key=f"debug_text_{i}")
+
+
+                                 # --- 2. Chunk Text ---
+                                 chunks = []
+                                 start_index = 0
+                                 while start_index < len(text):
+                                     end_index = min(start_index + chunk_size, len(text))
+                                     chunk_text = text[start_index:end_index].strip()
+                                     if chunk_text: # Only add non-empty chunks
+                                          chunks.append(chunk_text)
+                                     # Move start index for next chunk, considering overlap
+                                     start_index += chunk_size - chunk_overlap
+                                     # Ensure start_index doesn't go backward if overlap > size
+                                     if chunk_overlap >= chunk_size:
+                                          start_index = end_index # Simple non-overlapping if overlap >= size
+
+                                 if not chunks:
+                                      st.warning(f"⚠️ No chunks created for {file.name}. Skipping.")
+                                      files_failed += 1
+                                      continue
+
+                                 if debug_mode:
+                                      st.write(f"Created {len(chunks)} chunks.")
+                                      st.text_area("First Chunk Sample", chunks[0][:500]+"...", height=100, key=f"debug_chunk_{i}")
+
+
+                                 # --- 3. Store in Database (Transaction) ---
+                                 doc_id = str(uuid.uuid4())
+                                 chunk_ids = [f"{doc_id}_{j+1}" for j in range(len(chunks))]
+                                 uploader = st.session_state.get("username", "admin") # Default to admin if session lost
+
+                                 try:
+                                     with sqlite3.connect(DB_PATH, timeout=30.0) as upload_conn:
+                                         uc = upload_conn.cursor()
+                                         upload_conn.execute("BEGIN TRANSACTION")
+
+                                         # Insert document record
+                                         uc.execute(
+                                             "INSERT INTO documents (doc_id, filename, uploader, category, description, expiry_date, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                             (
+                                                 doc_id, file.name, uploader,
+                                                 metadata_opts['category'], metadata_opts['description'],
+                                                 metadata_opts['expiry_date'], 1 # Active by default
+                                             )
+                                         )
+
+                                         # Insert chunks (without embeddings initially if rebuild happens later)
+                                         chunk_data = [(chunk_ids[j], doc_id, chunks[j], None) for j in range(len(chunks))] # Embeddings = None for now
+                                         uc.executemany("INSERT INTO chunks (chunk_id, doc_id, text, embedding) VALUES (?, ?, ?, ?)", chunk_data)
+
+                                         upload_conn.commit() # Commit transaction
+
+                                     log_action(uploader, "upload_document", f"Uploaded '{file.name}' (ID: {doc_id}) with {len(chunks)} chunks.")
+                                     st.success(f"✅ Successfully processed and stored: {file.name} ({len(chunks)} chunks)")
+                                     files_processed += 1
+
+                                 except sqlite3.Error as db_err:
+                                     st.error(f"❌ Database error for {file.name}: {db_err}")
+                                     print(f"DB error during upload of {file.name}: {db_err}")
+                                     files_failed += 1
+                                     # Transaction should automatically roll back on context manager exit with error
+
+                             except Exception as proc_err:
+                                 st.error(f"❌ Unexpected error processing {file.name}: {proc_err}")
+                                 import traceback
+                                 print(f"Processing error for {file.name}: {proc_err}\n{traceback.format_exc()}")
+                                 files_failed += 1
+
+
+                        # --- Final Summary & Rebuild Prompt ---
+                        status_text_total.text("File processing complete.")
+                        progress_bar_total.progress(1.0)
+                        st.info(f"Processing finished: {files_processed} succeeded, {files_failed} failed.")
+
+                        if files_processed > 0:
+                             st.warning("⚠️ Remember to **Rebuild Index** (in the next tab) to make the new documents searchable!")
+
+
+        # --- Tab 3: Rebuild Index ---
+        with tab3:
+            st.subheader("Rebuild Search Index")
+            st.markdown("""
+            Click the button below to regenerate the search index based on all **active** documents currently in the database.
+            This process involves generating embeddings for each document chunk using the OpenAI API and can take some time depending on the number of documents.
+            """)
+            st.warning("Ensure your OpenAI API key is correctly configured in the sidebar settings before rebuilding.")
+
+            if st.button("Rebuild Index Now", type="primary"):
+                 # Check API key again just before rebuild
+                 client = get_openai_client()
+                 if not client:
+                      st.error("❌ Cannot rebuild index: OpenAI API key is missing or invalid.")
+                 else:
+                     with st.spinner("🛠️ Rebuilding search index... This may take a while."):
+                         success, count = rebuild_index_from_db() # Call the rebuild function
+                         if success:
+                             st.success(f"✅ Search index rebuilt successfully with {count} document chunks.")
+                         else:
+                             st.error("❌ Failed to rebuild search index. Check logs or previous errors.")
+
+
+    except Exception as e:
+        st.error(f"❌ Error on Document Management page: {str(e)}")
+        print(f"Admin Docs Page Error: {e}")
+    finally:
+        if conn: # Ensure connection is closed if opened
+            conn.close()
+
 
 def admin_users_page():
     """Admin user management page"""
     if not is_admin():
-        st.warning("Admin access required")
+        st.warning("⛔ Admin access required for this page.")
         return
-        
-    st.title("User Management")
-    
-    # Create tabs for different functions
-    tab1, tab2, tab3 = st.tabs(["👥 Users List", "➕ Create User", "📊 User Activity"])
-    
+
+    st.title("👥 User Management")
+
+    # Create tabs
+    tab1, tab2, tab3 = st.tabs(["Users List", "Create User", "User Activity Logs"])
+
     try:
-        # Tab 1: Users List
+        conn = sqlite3.connect(DB_PATH, timeout=20.0)
+
+        # --- Tab 1: Users List ---
         with tab1:
             st.subheader("All Users")
-            
-            # Get all users
-            conn = sqlite3.connect(DB_PATH, timeout=20.0)
             users_df = pd.read_sql_query(
-                """
-                SELECT username, role, email, full_name, created_at, last_login 
-                FROM users
-                ORDER BY username
-                """, 
-                conn
+                "SELECT username, role, email, full_name, created_at, last_login FROM users ORDER BY username", conn
             )
-            
+
             if users_df.empty:
-                st.info("No users found in the system.")
+                st.info("No users found.")
             else:
                 # Format dates
-                if 'created_at' in users_df.columns:
-                    users_df['created_at'] = pd.to_datetime(users_df['created_at']).dt.strftime('%Y-%m-%d %H:%M')
-                
-                if 'last_login' in users_df.columns:
-                    users_df['last_login'] = pd.to_datetime(users_df['last_login']).dt.strftime('%Y-%m-%d %H:%M')
-                
-                # Display as a dataframe
-                st.dataframe(
-                    users_df,
-                    column_config={
-                        "username": st.column_config.TextColumn("Username"),
-                        "role": st.column_config.TextColumn("Role"),
-                        "email": st.column_config.TextColumn("Email"),
-                        "full_name": st.column_config.TextColumn("Full Name"),
-                        "created_at": st.column_config.TextColumn("Created"),
-                        "last_login": st.column_config.TextColumn("Last Login")
-                    },
-                    use_container_width=True
-                )
-                
-                # User details and actions
-                st.subheader("User Details")
+                users_df['created_at'] = pd.to_datetime(users_df['created_at']).dt.strftime('%Y-%m-%d %H:%M')
+                users_df['last_login'] = pd.to_datetime(users_df['last_login']).dt.strftime('%Y-%m-%d %H:%M').fillna('Never')
+
+                st.dataframe(users_df, use_container_width=True)
+
+                st.divider()
+                st.subheader("User Actions")
+                user_options = {row['username']: f"{row['username']} ({row['role']})" for _, row in users_df.iterrows()}
                 selected_username = st.selectbox(
-                    "Select a user",
-                    users_df['username'].tolist()
+                    "Select user for actions:",
+                    options=list(user_options.keys()),
+                    format_func=lambda x: user_options.get(x, "Unknown User")
                 )
-                
+
                 if selected_username:
-                    # Get user details
-                    user_row = users_df[users_df['username'] == selected_username].iloc[0]
-                    
-                    col1, col2 = st.columns(2)
-                    
+                    selected_user_info = users_df[users_df['username'] == selected_username].iloc[0]
+                    current_role = selected_user_info['role']
+                    is_self = (selected_username == st.session_state.get('username')) # Prevent actions on self
+
+                    if is_self:
+                         st.info("ℹ️ You cannot perform administrative actions on your own account here. Use the Profile page.")
+
+                    col1, col2, col3 = st.columns(3)
+
                     with col1:
-                        st.write(f"**Username:** {user_row['username']}")
-                        st.write(f"**Role:** {user_row['role']}")
-                        st.write(f"**Email:** {user_row['email'] or 'Not set'}")
-                        
+                        # --- Reset Password ---
+                        st.write("**Reset Password**")
+                        if st.button("Reset Password", key=f"reset_pwd_{selected_username}", disabled=is_self):
+                            st.session_state[f"show_reset_{selected_username}"] = True # Use unique state key
+
+                        if st.session_state.get(f"show_reset_{selected_username}", False):
+                            with st.form(f"reset_pwd_form_{selected_username}"):
+                                new_pwd = st.text_input("New Password", type="password", key=f"new_pwd_{selected_username}")
+                                confirm_pwd = st.text_input("Confirm New Password", type="password", key=f"confirm_pwd_{selected_username}")
+                                reset_submitted = st.form_submit_button("Confirm Reset")
+
+                                if reset_submitted:
+                                    if not new_pwd or len(new_pwd) < 6:
+                                        st.error("Password must be at least 6 characters.")
+                                    elif new_pwd != confirm_pwd:
+                                        st.error("Passwords do not match.")
+                                    else:
+                                        try:
+                                            salt = "salt_key" # Ensure consistency
+                                            new_hash = hashlib.sha256(f"{new_pwd}:{salt}".encode()).hexdigest()
+                                            with sqlite3.connect(DB_PATH, timeout=20.0) as action_conn:
+                                                ac = action_conn.cursor()
+                                                ac.execute("UPDATE users SET password_hash = ? WHERE username = ?", (new_hash, selected_username))
+                                                action_conn.commit()
+                                            log_action(st.session_state['username'], "reset_password", f"Admin reset password for user: {selected_username}")
+                                            st.success(f"Password reset successfully for {selected_username}.")
+                                            st.session_state[f"show_reset_{selected_username}"] = False # Hide form
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Error resetting password: {e}")
+
+
                     with col2:
-                        st.write(f"**Full Name:** {user_row['full_name'] or 'Not set'}")
-                        st.write(f"**Created:** {user_row['created_at']}")
-                        st.write(f"**Last Login:** {user_row['last_login'] or 'Never'}")
-                    
-                    # User actions
-                    st.subheader("User Actions")
-                    
-                    action_col1, action_col2, action_col3 = st.columns(3)
-                    
-                    with action_col1:
-                        if st.button("Reset Password", disabled=(selected_username == st.session_state["username"])):
-                            st.session_state["show_reset_password"] = True
-                    
-                    with action_col2:
-                        if st.button("Change Role", disabled=(selected_username == st.session_state["username"])):
-                            st.session_state["show_change_role"] = True
-                            
-                    with action_col3:
-                        if st.button("Delete User", disabled=(selected_username == st.session_state["username"])):
-                            st.session_state["show_delete_user"] = True
-                    
-                    # Reset password form
-                    if st.session_state.get("show_reset_password", False):
-                        st.subheader("Reset Password")
-                        new_password = st.text_input("New Password", type="password")
-                        confirm_password = st.text_input("Confirm Password", type="password")
-                        
-                        if st.button("Submit Password Reset"):
-                            if not new_password or not confirm_password:
-                                st.error("Please enter both password fields")
-                            elif new_password != confirm_password:
-                                st.error("Passwords don't match")
-                            else:
+                         # --- Change Role ---
+                        st.write("**Change Role**")
+                        current_role_index = 0 if current_role == 'user' else 1
+                        new_role = st.selectbox("New Role", ["user", "admin"], index=current_role_index, key=f"role_{selected_username}", disabled=is_self)
+                        if st.button("Apply Role Change", key=f"change_role_{selected_username}", disabled=is_self or new_role == current_role):
+                             try:
+                                  with sqlite3.connect(DB_PATH, timeout=20.0) as action_conn:
+                                       ac = action_conn.cursor()
+                                       ac.execute("UPDATE users SET role = ? WHERE username = ?", (new_role, selected_username))
+                                       action_conn.commit()
+                                  log_action(st.session_state['username'], "change_role", f"Admin changed role for {selected_username} from {current_role} to {new_role}")
+                                  st.success(f"Role changed to {new_role} for {selected_username}.")
+                                  st.rerun()
+                             except Exception as e:
+                                  st.error(f"Error changing role: {e}")
+
+
+                    with col3:
+                        # --- Delete User ---
+                        st.write("**Delete User**")
+                        st.error("⚠️ Deletion is permanent!")
+                        if st.checkbox(f"Confirm deletion?", key=f"del_confirm_{selected_username}", disabled=is_self):
+                            if st.button("DELETE USER", type="primary", key=f"del_user_{selected_username}", disabled=is_self):
                                 try:
-                                    # Hash new password
-                                    password_hash = hashlib.sha256(f"{new_password}:salt_key".encode()).hexdigest()
-                                    
-                                    # Update in database
-                                    conn = sqlite3.connect(DB_PATH, timeout=20.0)
-                                    c = conn.cursor()
-                                    c.execute(
-                                        "UPDATE users SET password_hash = ? WHERE username = ?",
-                                        (password_hash, selected_username)
-                                    )
-                                    conn.commit()
-                                    conn.close()
-                                    
-                                    log_action(
-                                        st.session_state["username"],
-                                        "reset_password",
-                                        f"Password reset for user: {selected_username}"
-                                    )
-                                    
-                                    st.success(f"Password for {selected_username} has been reset")
-                                    st.session_state["show_reset_password"] = False
+                                    with sqlite3.connect(DB_PATH, timeout=20.0) as action_conn:
+                                        action_conn.execute("PRAGMA foreign_keys = ON")
+                                        ac = action_conn.cursor()
+                                        # Cascade delete should handle related data (feedback, qa_pairs, history)
+                                        ac.execute("DELETE FROM users WHERE username = ?", (selected_username,))
+                                        action_conn.commit()
+                                    log_action(st.session_state['username'], "delete_user", f"Admin deleted user: {selected_username}")
+                                    st.success(f"User {selected_username} deleted successfully.")
                                     st.rerun()
                                 except Exception as e:
-                                    st.error(f"Error resetting password: {str(e)}")
-                    
-                    # Change role form
-                    if st.session_state.get("show_change_role", False):
-                        st.subheader("Change User Role")
-                        new_role = st.selectbox(
-                            "New Role",
-                            ["user", "admin"],
-                            index=0 if user_row['role'] == "user" else 1
-                        )
-                        
-                        if st.button("Submit Role Change"):
-                            try:
-                                # Update role in database
-                                conn = sqlite3.connect(DB_PATH, timeout=20.0)
-                                c = conn.cursor()
-                                c.execute(
-                                    "UPDATE users SET role = ? WHERE username = ?",
-                                    (new_role, selected_username)
-                                )
-                                conn.commit()
-                                conn.close()
-                                
-                                log_action(
-                                    st.session_state["username"],
-                                    "change_role",
-                                    f"Changed role for user {selected_username} from {user_row['role']} to {new_role}"
-                                )
-                                
-                                st.success(f"Role for {selected_username} changed to {new_role}")
-                                st.session_state["show_change_role"] = False
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Error changing role: {str(e)}")
-                    
-                    # Delete user form
-                    if st.session_state.get("show_delete_user", False):
-                        st.subheader("Delete User")
-                        st.warning(f"Are you sure you want to delete user '{selected_username}'? This action cannot be undone.")
-                        
-                        confirm = st.checkbox("I understand that this will permanently delete this user and all associated data")
-                        
-                        if st.button("Confirm Delete") and confirm:
-                            try:
-                                conn = sqlite3.connect(DB_PATH, timeout=20.0)
-                                c = conn.cursor()
-                                
-                                # Delete user's data from related tables
-                                c.execute("DELETE FROM search_history WHERE user_id = ?", (selected_username,))
-                                c.execute("DELETE FROM feedback WHERE user_id = ?", (selected_username,))
-                                c.execute("DELETE FROM qa_pairs WHERE user_id = ?", (selected_username,))
-                                
-                                # Finally delete the user
-                                c.execute("DELETE FROM users WHERE username = ?", (selected_username,))
-                                
-                                conn.commit()
-                                conn.close()
-                                
-                                log_action(
-                                    st.session_state["username"],
-                                    "delete_user",
-                                    f"Deleted user: {selected_username}"
-                                )
-                                
-                                st.success(f"User '{selected_username}' has been deleted")
-                                st.session_state["show_delete_user"] = False
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Error deleting user: {str(e)}")
-                    
-                    # Get user activity
-                    st.subheader("User Activity")
-                    
-                    user_activity = pd.read_sql_query(
-                        """
-                        SELECT action, timestamp, details 
-                        FROM audit_log
-                        WHERE user_id = ?
-                        ORDER BY timestamp DESC
-                        LIMIT 10
-                        """,
-                        conn,
-                        params=(selected_username,)
-                    )
-                    
-                    if not user_activity.empty:
-                        user_activity['timestamp'] = pd.to_datetime(user_activity['timestamp']).dt.strftime('%Y-%m-%d %H:%M')
-                        
-                        st.dataframe(
-                            user_activity,
-                            column_config={
-                                "timestamp": st.column_config.TextColumn("Time"),
-                                "action": st.column_config.TextColumn("Action"),
-                                "details": st.column_config.TextColumn("Details")
-                            },
-                            use_container_width=True
-                        )
-                    else:
-                        st.info("No activity records found for this user")
-        
-        # Tab 2: Create User
+                                    st.error(f"Error deleting user: {e}")
+
+
+        # --- Tab 2: Create User ---
         with tab2:
             st.subheader("Create New User")
-            
-            # User creation form
             with st.form("create_user_form"):
-                username = st.text_input("Username")
-                password = st.text_input("Password", type="password")
-                confirm_password = st.text_input("Confirm Password", type="password")
-                
-                role = st.selectbox("Role", ["user", "admin"], index=0)
-                email = st.text_input("Email (optional)")
-                full_name = st.text_input("Full Name (optional)")
-                
-                submitted = st.form_submit_button("Create User")
-                
-                if submitted:
-                    if not username or not password or not confirm_password:
-                        st.error("Username and password are required")
-                    elif password != confirm_password:
-                        st.error("Passwords don't match")
-                    elif len(password) < 6:
-                        st.error("Password must be at least 6 characters long")
+                new_username = st.text_input("Username*")
+                new_password = st.text_input("Password*", type="password")
+                confirm_password = st.text_input("Confirm Password*", type="password")
+                new_role = st.selectbox("Role*", ["user", "admin"], index=0)
+                new_email = st.text_input("Email (optional)")
+                new_full_name = st.text_input("Full Name (optional)")
+                create_submitted = st.form_submit_button("Create User")
+
+                if create_submitted:
+                    if not new_username or not new_password or not confirm_password:
+                        st.error("Username, Password, and Confirmation are required.")
+                    elif new_password != confirm_password:
+                        st.error("Passwords do not match.")
+                    elif len(new_password) < 6:
+                         st.error("Password must be at least 6 characters.")
                     else:
                         try:
-                            # Check if username already exists
-                            conn = sqlite3.connect(DB_PATH, timeout=20.0)
-                            c = conn.cursor()
-                            
-                            c.execute("SELECT username FROM users WHERE username = ?", (username,))
-                            if c.fetchone():
-                                st.error("Username already exists")
-                                conn.close()
+                            # Check if username exists
+                            cursor = conn.cursor()
+                            cursor.execute("SELECT 1 FROM users WHERE username = ?", (new_username,))
+                            if cursor.fetchone():
+                                st.error("Username already exists.")
                             else:
-                                # Create password hash
-                                password_hash = hashlib.sha256(f"{password}:salt_key".encode()).hexdigest()
-                                
-                                # Create user
-                                c.execute(
-                                    "INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                    (username, password_hash, role, email, full_name, 
-                                    datetime.datetime.now().isoformat(), None)
+                                # Hash password and insert
+                                salt = "salt_key" # Ensure consistency
+                                new_hash = hashlib.sha256(f"{new_password}:{salt}".encode()).hexdigest()
+                                cursor.execute(
+                                    "INSERT INTO users (username, password_hash, role, email, full_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                                    (new_username, new_hash, new_role, new_email or None, new_full_name or None, datetime.datetime.now().isoformat())
                                 )
-                                
                                 conn.commit()
-                                conn.close()
-                                
-                                log_action(
-                                    st.session_state["username"],
-                                    "create_user",
-                                    f"Created user: {username} with role: {role}"
-                                )
-                                
-                                st.success(f"User '{username}' created successfully")
+                                log_action(st.session_state['username'], "create_user", f"Admin created new user: {new_username} (Role: {new_role})")
+                                st.success(f"User '{new_username}' created successfully!")
+                                # Clear form? Usually happens on rerun.
+                        except sqlite3.IntegrityError as ie:
+                             # Catch potential unique constraint errors (like email)
+                             st.error(f"Database error: Could not create user. Email might already be in use. ({ie})")
                         except Exception as e:
-                            st.error(f"Error creating user: {str(e)}")
-        
-        # Tab 3: User Activity
+                            st.error(f"Error creating user: {e}")
+
+
+        # --- Tab 3: User Activity Logs ---
         with tab3:
-            st.subheader("User Activity Overview")
-            
-            # Time period selection
-            time_period = st.selectbox(
-                "Time Period",
-                ["Last 7 days", "Last 30 days", "All time"],
-                index=1
-            )
-            
-            # Convert time period to SQL date filter
-            date_filters = {
-                "Last 7 days": "date('now', '-7 days')",
-                "Last 30 days": "date('now', '-30 days')",
-                "All time": "date('1970-01-01')"  # Unix epoch
-            }
-            
-            date_filter = date_filters[time_period]
-            
-            # Most active users
-            active_users = pd.read_sql_query(
+            st.subheader("User Activity Logs (Audit Trail)")
+            log_limit = st.number_input("Number of recent logs to display:", min_value=10, max_value=500, value=100, step=10)
+
+            audit_df = pd.read_sql_query(
                 f"""
-                SELECT 
-                    user_id,
-                    COUNT(*) as action_count
+                SELECT timestamp, user_id, action, details
                 FROM audit_log
-                WHERE date(timestamp) > {date_filter}
-                GROUP BY user_id
-                ORDER BY action_count DESC
-                LIMIT 10
-                """,
-                conn
+                ORDER BY timestamp DESC
+                LIMIT {log_limit}
+                """, conn
             )
-            
-            # User logins
-            user_logins = pd.read_sql_query(
-                f"""
-                SELECT 
-                    user_id,
-                    COUNT(*) as login_count
-                FROM audit_log
-                WHERE action = 'login'
-                AND date(timestamp) > {date_filter}
-                GROUP BY user_id
-                ORDER BY login_count DESC
-                LIMIT 10
-                """,
-                conn
-            )
-            
-            # Action distribution
-            action_dist = pd.read_sql_query(
-                f"""
-                SELECT 
-                    action,
-                    COUNT(*) as count
-                FROM audit_log
-                WHERE date(timestamp) > {date_filter}
-                GROUP BY action
-                ORDER BY count DESC
-                """,
-                conn
-            )
-            
-            # Display visualizations
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.subheader("Most Active Users")
-                if not active_users.empty:
-                    st.bar_chart(active_users.set_index('user_id')['action_count'])
-                else:
-                    st.info("No user activity data for the selected period")
-                    
-            with col2:
-                st.subheader("Most Frequent Logins")
-                if not user_logins.empty:
-                    st.bar_chart(user_logins.set_index('user_id')['login_count'])
-                else:
-                    st.info("No login data for the selected period")
-            
-            # Action distribution
-            st.subheader("Action Distribution")
-            if not action_dist.empty:
-                st.bar_chart(action_dist.set_index('action')['count'])
+
+            if audit_df.empty:
+                st.info("No audit logs found.")
             else:
-                st.info("No action data for the selected period")
-            
-        conn.close()
+                audit_df['timestamp'] = pd.to_datetime(audit_df['timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
+                st.dataframe(audit_df, use_container_width=True)
+
+
     except Exception as e:
-        st.error(f"Error in user management: {str(e)}")
+        st.error(f"❌ Error on User Management page: {str(e)}")
+        print(f"Admin Users Page Error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
 
 def admin_analytics_page():
     """Admin analytics dashboard page"""
     if not is_admin():
-        st.warning("Admin access required")
+        st.warning("⛔ Admin access required for this page.")
         return
-        
-    st.title("Analytics Dashboard")
-    
-    # Create tabs for different analytics sections
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📊 Usage Statistics", 
-        "💬 Feedback Analysis",
-        "🔍 Search Patterns", 
-        "📑 Document Analytics"
-    ])
-    
+
+    st.title("📊 Analytics Dashboard")
+
+    # Tabs for different analytics
+    tab_names = ["Usage Stats", "Feedback Analysis", "Search Patterns", "Document Stats"]
+    tabs = st.tabs(tab_names)
+
     try:
         conn = sqlite3.connect(DB_PATH, timeout=20.0)
-        
-        # Tab 1: Usage Statistics
-        with tab1:
-            st.subheader("System Usage")
-            
-            # Get counts from different tables
-            query_counts = pd.read_sql_query(
+
+        # --- Tab 1: Usage Statistics ---
+        with tabs[0]:
+            st.subheader("System Usage Overview")
+
+            # Fetch counts
+            counts_query = """
+            SELECT
+                (SELECT COUNT(*) FROM users) as users_count,
+                (SELECT COUNT(*) FROM documents WHERE is_active = 1) as active_docs_count,
+                (SELECT COUNT(*) FROM documents WHERE is_active = 0) as inactive_docs_count,
+                (SELECT COUNT(DISTINCT doc_id) FROM chunks
+                 JOIN documents ON chunks.doc_id = documents.doc_id WHERE documents.is_active = 1) as indexed_docs_count,
+                (SELECT COUNT(*) FROM chunks
+                 JOIN documents ON chunks.doc_id = documents.doc_id WHERE documents.is_active = 1) as active_chunks_count,
+                (SELECT COUNT(*) FROM qa_pairs) as qa_count,
+                (SELECT COUNT(*) FROM search_history) as searches_count,
+                (SELECT COUNT(*) FROM feedback) as feedback_count
+            """
+            counts_df = pd.read_sql_query(counts_query, conn)
+            counts = counts_df.iloc[0] if not counts_df.empty else None
+
+            if counts is not None:
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Total Users", counts['users_count'])
+                col1.metric("Active Documents", counts['active_docs_count'])
+                col1.metric("Inactive Documents", counts['inactive_docs_count'])
+
+                col2.metric("Documents in Index", counts['indexed_docs_count']) # Docs with active chunks
+                col2.metric("Chunks in Index", counts['active_chunks_count']) # Active chunks
+                col2.metric("Questions Answered", counts['qa_count'])
+
+                col3.metric("Total Searches", counts['searches_count'])
+                col3.metric("Feedback Entries", counts['feedback_count'])
+            else:
+                st.warning("Could not fetch usage counts.")
+
+            # Activity over time (e.g., searches per day)
+            st.divider()
+            st.subheader("Activity Over Time (Last 30 Days)")
+            activity_df = pd.read_sql_query(
                 """
-                SELECT 
-                    (SELECT COUNT(*) FROM users) as users_count,
-                    (SELECT COUNT(*) FROM documents) as documents_count,
-                    (SELECT COUNT(*) FROM chunks) as chunks_count,
-                    (SELECT COUNT(*) FROM qa_pairs) as qa_count,
-                    (SELECT COUNT(*) FROM search_history) as searches_count,
-                    (SELECT COUNT(*) FROM feedback) as feedback_count
-                """,
-                conn
-            )
-            
-            # Get recent activity
-            recent_activity = pd.read_sql_query(
-                """
-                SELECT action, user_id, timestamp, details
-                FROM audit_log
-                ORDER BY timestamp DESC
-                LIMIT 50
-                """,
-                conn
-            )
-            
-            # Get user activity over time
-            user_activity = pd.read_sql_query(
-                """
-                SELECT 
-                    date(timestamp) as date,
-                    COUNT(*) as count,
-                    action
-                FROM audit_log
-                GROUP BY date(timestamp), action
+                SELECT date(timestamp) as date, COUNT(*) as count
+                FROM search_history
+                WHERE date(timestamp) >= date('now', '-30 days')
+                GROUP BY date
                 ORDER BY date
-                """,
-                conn
+                """, conn
             )
-            
-            # Display metrics in columns
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("Total Users", query_counts['users_count'].iloc[0])
-                st.metric("Total Documents", query_counts['documents_count'].iloc[0])
-                
-            with col2:
-                st.metric("Document Chunks", query_counts['chunks_count'].iloc[0])
-                st.metric("Total Queries", query_counts['qa_count'].iloc[0])
-                
-            with col3:
-                st.metric("Search Count", query_counts['searches_count'].iloc[0])
-                st.metric("Feedback Collected", query_counts['feedback_count'].iloc[0])
-            
-            # Activity over time visualization
-            if not user_activity.empty:
-                st.subheader("Activity Over Time")
-                # Group actions into categories for better visualization
-                grouped_activity = user_activity.groupby('date')['count'].sum().reset_index()
-                
-                st.bar_chart(grouped_activity.set_index('date'))
-                
-            # Recent activity table
-            st.subheader("Recent Activity")
-            if not recent_activity.empty:
-                # Format timestamp
-                recent_activity['formatted_time'] = pd.to_datetime(recent_activity['timestamp']).dt.strftime('%Y-%m-%d %H:%M')
-                
-                st.dataframe(
-                    recent_activity[['formatted_time', 'user_id', 'action', 'details']],
-                    column_config={
-                        "formatted_time": st.column_config.TextColumn("Time"),
-                        "user_id": st.column_config.TextColumn("User"),
-                        "action": st.column_config.TextColumn("Action"),
-                        "details": st.column_config.TextColumn("Details")
-                    },
-                    use_container_width=True
+            if not activity_df.empty:
+                 activity_df['date'] = pd.to_datetime(activity_df['date'])
+                 st.line_chart(activity_df.set_index('date')['count'], use_container_width=True)
+            else:
+                 st.info("No search activity in the last 30 days.")
+
+
+        # --- Tab 2: Feedback Analysis ---
+        with tabs[1]:
+            st.subheader("User Feedback Analysis")
+
+            feedback_stats = pd.read_sql_query(
+                "SELECT COUNT(*) as total, AVG(rating) as avg_rating FROM feedback", conn
+            )
+            total_fb = feedback_stats['total'].iloc[0] if not feedback_stats.empty else 0
+            avg_rating = feedback_stats['avg_rating'].iloc[0] if not feedback_stats.empty and feedback_stats['avg_rating'].iloc[0] is not None else 0
+
+            col1, col2 = st.columns(2)
+            col1.metric("Total Feedback Entries", total_fb)
+            col2.metric("Average Rating", f"{avg_rating:.2f} / 3.00" if total_fb > 0 else "N/A")
+
+            if total_fb > 0:
+                rating_dist = pd.read_sql_query(
+                    "SELECT rating, COUNT(*) as count FROM feedback GROUP BY rating ORDER BY rating", conn
                 )
-            else:
-                st.info("No recent activity recorded")
-        
-        # Tab 2: Feedback Analysis
-        with tab2:
-            st.subheader("Feedback Analysis")
-            
-            # Get feedback stats
-            stats_df = pd.read_sql_query(
-                """
-                SELECT 
-                    COUNT(*) as total_feedback,
-                    AVG(rating) as avg_rating
-                FROM feedback
-                """,
-                conn
-            )
-            
-            # Rating distribution
-            rating_dist = pd.read_sql_query(
-                """
-                SELECT rating, COUNT(*) as count
-                FROM feedback
-                GROUP BY rating
-                ORDER BY rating
-                """,
-                conn
-            )
-            
-            # Recent feedback
-            recent_feedback = pd.read_sql_query(
-                """
-                SELECT f.rating, f.comment, f.timestamp, q.query
-                FROM feedback f
-                JOIN qa_pairs q ON f.question_id = q.question_id
-                ORDER BY f.timestamp DESC
-                LIMIT 10
-                """,
-                conn
-            )
-            
-            if not stats_df.empty:
-                avg_rating = stats_df['avg_rating'].iloc[0]
-                total_feedback = stats_df['total_feedback'].iloc[0]
-                
-                st.metric("Average Rating", f"{avg_rating:.2f}/3.00" if avg_rating is not None else "No ratings")
-                st.metric("Total Feedback Collected", total_feedback)
-                
-                # Rating distribution visualization
-                if not rating_dist.empty:
-                    st.subheader("Rating Distribution")
-                    
-                    rating_labels = {
-                        1: "Not Helpful",
-                        2: "Somewhat Helpful",
-                        3: "Very Helpful"
-                    }
-                    
-                    # Add rating labels
-                    rating_dist['rating_label'] = rating_dist['rating'].map(rating_labels)
-                    
-                    # Create a horizontal bar chart
-                    st.bar_chart(rating_dist.set_index('rating_label')['count'])
-                    
-                # Recent feedback
-                st.subheader("Recent Feedback")
-                if not recent_feedback.empty:
-                    for _, row in recent_feedback.iterrows():
-                        with st.container():
-                            col1, col2 = st.columns([3, 1])
-                            
-                            rating_emoji = {
-                                1: "❌ Not Helpful",
-                                2: "⚠️ Somewhat Helpful",
-                                3: "✅ Very Helpful"
-                            }
-                            
-                            with col1:
-                                st.write(f"**Query:** {row['query']}")
-                                if row['comment']:
-                                    st.write(f"**Comment:** {row['comment']}")
-                            
-                            with col2:
-                                st.write(f"**Rating:** {rating_emoji.get(row['rating'], 'Unknown')}")
-                                st.caption(f"{row['timestamp'][:10] if row['timestamp'] else ''}")
-                            
-                            st.divider()
+                rating_labels = {1: "1 - Not Helpful", 2: "2 - Somewhat", 3: "3 - Very Helpful"}
+                rating_dist['Rating Label'] = rating_dist['rating'].map(rating_labels)
+                st.bar_chart(rating_dist.set_index('Rating Label')['count'], use_container_width=True)
+
+                st.divider()
+                st.subheader("Recent Feedback Comments")
+                recent_comments = pd.read_sql_query(
+                    """
+                    SELECT f.rating, f.comment, f.timestamp, q.query
+                    FROM feedback f JOIN qa_pairs q ON f.question_id = q.question_id
+                    WHERE f.comment IS NOT NULL AND f.comment != ''
+                    ORDER BY f.timestamp DESC LIMIT 20
+                    """, conn
+                )
+                if not recent_comments.empty:
+                     for _, row in recent_comments.iterrows():
+                          st.markdown(f"**Rating: {row['rating']}/3** on *{pd.to_datetime(row['timestamp']).strftime('%Y-%m-%d')}* for Q: `{row['query'][:60]}...`")
+                          st.markdown(f"> {row['comment']}")
+                          st.markdown("---")
                 else:
-                    st.info("No feedback collected yet")
+                     st.info("No recent feedback with comments.")
             else:
-                st.info("No feedback data available")
-        
-        # Tab 3: Search Patterns
-        with tab3:
-            st.subheader("Search Patterns")
-            
-            # Get popular searches
+                st.info("No feedback has been submitted yet.")
+
+
+        # --- Tab 3: Search Patterns ---
+        with tabs[2]:
+            st.subheader("Search Query Analysis")
+
+            # Most frequent searches
             popular_searches = pd.read_sql_query(
                 """
                 SELECT query, COUNT(*) as count
-                FROM search_history
-                GROUP BY query
-                ORDER BY count DESC
-                LIMIT 15
-                """,
-                conn
+                FROM search_history GROUP BY query ORDER BY count DESC LIMIT 20
+                """, conn
             )
-            
-            # Get search success rate - assuming num_results > 0 means successful search
-            search_success = pd.read_sql_query(
-                """
-                SELECT 
-                    date(timestamp) as date,
-                    COUNT(*) as total_searches,
-                    SUM(CASE WHEN num_results > 0 THEN 1 ELSE 0 END) as successful_searches
-                FROM search_history
-                GROUP BY date(timestamp)
-                ORDER BY date
-                """,
-                conn
-            )
-            
-            # Query length analysis
-            query_length = pd.read_sql_query(
-                """
-                SELECT 
-                    length(query) as query_length,
-                    COUNT(*) as count
-                FROM search_history
-                GROUP BY length(query)
-                ORDER BY length(query)
-                """,
-                conn
-            )
-            
-            # Popular searches
-            st.subheader("Popular Searches")
             if not popular_searches.empty:
-                # Create a horizontal bar chart for popular searches
-                popular_sorted = popular_searches.sort_values(by='count')
-                st.bar_chart(popular_sorted.set_index('query')['count'])
+                 st.write("**Most Frequent Searches:**")
+                 st.dataframe(popular_searches, use_container_width=True)
             else:
-                st.info("No search data available")
-                
-            # Search success rate
-            if not search_success.empty and not search_success.empty.all():
-                st.subheader("Search Success Rate")
-                
-                # Calculate success rate
-                search_success['success_rate'] = (
-                    search_success['successful_searches'] / search_success['total_searches']
-                ) * 100
-                
-                # Line chart for success rate
-                st.line_chart(search_success.set_index('date')['success_rate'])
-                
-            # Query length distribution
-            if not query_length.empty:
-                st.subheader("Query Length Distribution")
-                st.bar_chart(query_length.set_index('query_length')['count'])
-        
-        # Tab 4: Document Analytics
-        with tab4:
-            st.subheader("Document Analytics")
-            
-            # Document categories
-            doc_categories = pd.read_sql_query(
+                 st.info("No search history found.")
+
+            # Searches with no results
+            no_results_searches = pd.read_sql_query(
                 """
-                SELECT 
-                    category,
-                    COUNT(*) as count
-                FROM documents
-                GROUP BY category
-                ORDER BY count DESC
-                """,
-                conn
+                SELECT query, COUNT(*) as count
+                FROM search_history WHERE num_results = 0
+                GROUP BY query ORDER BY count DESC LIMIT 20
+                """, conn
             )
-            
+            if not no_results_searches.empty:
+                 st.divider()
+                 st.write("**Searches Returning No Results:**")
+                 st.dataframe(no_results_searches, use_container_width=True)
+            else:
+                 st.info("No searches recorded with zero results.")
+
+
+        # --- Tab 4: Document Stats ---
+        with tabs[3]:
+            st.subheader("Document Statistics")
+
+            # Document count by category
+            category_counts = pd.read_sql_query(
+                "SELECT category, COUNT(*) as count FROM documents GROUP BY category ORDER BY count DESC", conn
+            )
+            if not category_counts.empty:
+                 st.write("**Documents per Category:**")
+                 st.bar_chart(category_counts.set_index('category')['count'], use_container_width=True)
+            else:
+                 st.info("No documents found to categorize.")
+
             # Document upload timeline
-            doc_timeline = pd.read_sql_query(
+            upload_timeline = pd.read_sql_query(
                 """
-                SELECT 
-                    date(upload_date) as upload_date,
-                    COUNT(*) as count
-                FROM documents
-                GROUP BY date(upload_date)
-                ORDER BY upload_date
-                """,
-                conn
+                SELECT date(upload_date) as date, COUNT(*) as count
+                FROM documents GROUP BY date ORDER BY date
+                """, conn
             )
-            
-            # Document status counts
-            doc_status = pd.read_sql_query(
-                """
-                SELECT 
-                    is_active,
-                    COUNT(*) as count
-                FROM documents
-                GROUP BY is_active
-                """,
-                conn
-            )
-            
-            # Document categories
-            st.subheader("Document Categories")
-            if not doc_categories.empty:
-                st.bar_chart(doc_categories.set_index('category')['count'])
+            if not upload_timeline.empty:
+                 st.divider()
+                 st.write("**Document Uploads Over Time:**")
+                 upload_timeline['date'] = pd.to_datetime(upload_timeline['date'])
+                 st.line_chart(upload_timeline.set_index('date')['count'], use_container_width=True)
             else:
-                st.info("No document category data available")
-                
-            # Document status
-            st.subheader("Document Status")
-            if not doc_status.empty:
-                # Add status labels
-                doc_status['status'] = doc_status['is_active'].map({
-                    0: "Inactive",
-                    1: "Active"
-                })
-                st.bar_chart(doc_status.set_index('status')['count'])
-            else:
-                st.info("No document status data available")
-                
-            # Document upload timeline
-            if not doc_timeline.empty:
-                st.subheader("Document Upload Timeline")
-                st.line_chart(doc_timeline.set_index('upload_date')['count'])
-            
-        conn.close()
-        
+                 st.info("No document upload history found.")
+
+
     except Exception as e:
-        st.error(f"Error loading analytics data: {str(e)}")
+        st.error(f"❌ Error loading analytics data: {str(e)}")
+        print(f"Analytics Page Error: {e}")
+    finally:
+        if conn:
+            conn.close()
 
-# Initialize the database
-init_database()
 
-# Initialize session state variables
-initialize_session_state()
+# --- Main App Logic ---
 
-# Display sidebar if authenticated
-if st.session_state["authenticated"]:
+# Attempt DB initialization (safe to call multiple times)
+if init_database():
+    # Initialize session state if DB init is successful
+    initialize_session_state()
+
+    # Load index early to provide feedback
+    load_search_index()
+
+    # Render sidebar based on auth state AFTER initialization
     render_sidebar()
 
-# Page routing based on authentication state
-if not st.session_state["authenticated"]:
-    # Show login form
-    login_form()
-else:
-    # Route to the appropriate page based on session state
-    page = st.session_state.get("page", "main")
-    
-    if page == "main":
+    # Page routing
+    page = st.session_state.get("page", "login") # Default to login
+
+    if not st.session_state.get("authenticated"):
+        login_form()
+    elif page == "main":
         main_page()
     elif page == "profile":
         profile_page()
@@ -2473,6 +2275,13 @@ else:
     elif page == "admin_analytics":
         admin_analytics_page()
     else:
-        st.warning(f"Page '{page}' not found")
+        # Fallback to main page if route is unknown
+        st.warning(f"Unknown page '{page}'. Redirecting to home.")
         st.session_state["page"] = "main"
-        st.rerun()
+        main_page()
+
+else:
+    # Critical DB Error on startup
+    st.error("🚨 CRITICAL ERROR: Could not initialize the database. Application cannot start.")
+    # You might want to provide more specific guidance here
+    # e.g., check file permissions, disk space, or contact support.
