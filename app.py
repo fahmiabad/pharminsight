@@ -243,10 +243,16 @@ def get_openai_client():
         client = OpenAI(api_key=api_key)
         # Perform a simple test call to validate the key
         client.models.list()
+        # Store the validated key in session state if it wasn't there before
+        if not st.session_state.get("openai_api_key"):
+             st.session_state["openai_api_key"] = api_key
         return client
     except Exception as e:
         st.error(f"❌ Error initializing or validating OpenAI client: {e}")
         print(f"OpenAI client initialization error: {e}")
+        # Clear potentially invalid key from session state
+        if "openai_api_key" in st.session_state:
+             del st.session_state["openai_api_key"]
         # st.stop() # Don't stop the entire app
         return None
 
@@ -432,6 +438,15 @@ def rebuild_index_from_db():
 
 def load_search_index():
     """Load the search index and metadata, attempting rebuild if necessary."""
+    # Check if index is already loaded in session state to avoid redundant loads/rebuilds
+    if "faiss_index" in st.session_state and "index_metadata" in st.session_state:
+         # Optional: Add a check for staleness if needed (e.g., based on file modification time)
+         index = st.session_state["faiss_index"]
+         metadata = st.session_state["index_metadata"]
+         # Small feedback that it's already loaded
+         # st.sidebar.caption(f"Index in memory ({index.ntotal} vectors)")
+         return index, metadata
+
     try:
         if os.path.exists(INDEX_PATH) and os.path.exists(DOCS_METADATA_PATH):
             index = faiss.read_index(INDEX_PATH)
@@ -441,6 +456,9 @@ def load_search_index():
             # Basic sanity check
             if index.ntotal != len(metadata):
                  st.sidebar.warning(f"⚠️ Index size ({index.ntotal}) mismatch with metadata ({len(metadata)}). Consider rebuilding.")
+            # Store loaded index in session state
+            st.session_state["faiss_index"] = index
+            st.session_state["index_metadata"] = metadata
             return index, metadata
         else:
             st.sidebar.warning("⚠️ Index files not found. Attempting to rebuild...")
@@ -453,6 +471,9 @@ def load_search_index():
                     index = faiss.read_index(INDEX_PATH)
                     with open(DOCS_METADATA_PATH, "rb") as f:
                         metadata = pickle.load(f)
+                    # Store loaded index in session state
+                    st.session_state["faiss_index"] = index
+                    st.session_state["index_metadata"] = metadata
                     return index, metadata
                 else:
                      st.sidebar.error("❌ Rebuild reported success, but index files still missing.")
@@ -474,20 +495,23 @@ def load_search_index():
     st.sidebar.error("⚠️ Returning empty index.")
     dimension = 1536  # Default for OpenAI embeddings
     empty_index = faiss.IndexFlatIP(dimension)
+    # Store empty index in session state to prevent repeated load attempts in same run
+    st.session_state["faiss_index"] = empty_index
+    st.session_state["index_metadata"] = []
     return empty_index, []
 
 # --- Search & Answer Generation ---
 def search_documents(query, k=5, threshold=0.7):
     """Search for relevant documents using FAISS index."""
     # --- Debug Start ---
-    st.write("--- Debug: Entering search_documents ---")
-    st.write(f"Query: '{query[:100]}...', k={k}, threshold={threshold}")
+    # st.write("--- Debug: Entering search_documents ---")
+    # st.write(f"Query: '{query[:100]}...', k={k}, threshold={threshold}")
     # --- Debug End ---
 
-    # Load index and metadata
+    # Load index and metadata (uses session state cache now)
     index, metadata = load_search_index()
     # --- Debug Start ---
-    st.write(f"Debug: Index loaded - ntotal={index.ntotal}, Metadata length: {len(metadata)}")
+    # st.write(f"Debug: Index loaded - ntotal={index.ntotal}, Metadata length: {len(metadata)}")
      # Check if index dimension matches expected embedding dimension
     expected_dim = 1536 # For text-embedding-3-small
     if index.ntotal > 0 and index.d != expected_dim:
@@ -496,14 +520,14 @@ def search_documents(query, k=5, threshold=0.7):
 
 
     if index.ntotal == 0 or not metadata:
-        st.warning("Debug: Index is empty or no metadata found. Cannot perform search.") # Debug
+        # st.warning("Debug: Index is empty or no metadata found. Cannot perform search.") # Debug
         return [] # Return empty list if index is not usable
 
     # Get query embedding
     try:
-        st.write("Debug: Generating query embedding...") # Debug
+        # st.write("Debug: Generating query embedding...") # Debug
         query_embedding = get_embedding(query)
-        st.write(f"Debug: Query embedding shape: {query_embedding.shape}, norm: {np.linalg.norm(query_embedding):.4f}") # Debug
+        # st.write(f"Debug: Query embedding shape: {query_embedding.shape}, norm: {np.linalg.norm(query_embedding):.4f}") # Debug
         # Ensure it's 2D for FAISS search
         query_embedding = query_embedding.reshape(1, -1)
         # Ensure normalization (get_embedding should do this, but double-check)
@@ -522,23 +546,23 @@ def search_documents(query, k=5, threshold=0.7):
         # Determine the actual number of neighbors to search for
         actual_k = min(k, index.ntotal)
         if actual_k <= 0:
-             st.warning("Debug: No neighbors to search for (k or index total is zero).")
+             # st.warning("Debug: No neighbors to search for (k or index total is zero).")
              return []
 
-        st.write(f"Debug: Searching index with k={actual_k}...") # Debug
+        # st.write(f"Debug: Searching index with k={actual_k}...") # Debug
         # `index.search` returns distances (inner product scores for IndexFlatIP) and indices
         distances, indices = index.search(query_embedding, actual_k)
-        st.write(f"Debug: Raw search results - Distances: {distances}, Indices: {indices}") # Debug
+        # st.write(f"Debug: Raw search results - Distances: {distances}, Indices: {indices}") # Debug
 
         # Process results if any were found
         if indices.size > 0 and distances.size > 0:
             for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
                  # FAISS can return -1 for indices if k > ntotal, though we handle k above
                  if idx == -1:
-                      st.warning(f"Debug: FAISS returned index -1 for result {i}. Skipping.")
+                      # st.warning(f"Debug: FAISS returned index -1 for result {i}. Skipping.")
                       continue
 
-                 st.write(f"Debug: Checking result {i}: Index={idx}, Distance (Score)={dist:.4f}") # Debug
+                 # st.write(f"Debug: Checking result {i}: Index={idx}, Distance (Score)={dist:.4f}") # Debug
 
                  # Check index bounds rigorously
                  if 0 <= idx < len(metadata):
@@ -548,9 +572,9 @@ def search_documents(query, k=5, threshold=0.7):
                          doc = metadata[idx].copy()
                          doc["score"] = float(dist) # Add the score to the result
                          results.append(doc)
-                         st.write(f"✅ Debug: Added result {i} (Score: {dist:.4f} >= {threshold}) - Source: {doc.get('source', 'N/A')}") # Debug
-                     else:
-                         st.write(f"📉 Debug: Result {i} below threshold ({dist:.4f} < {threshold})") # Debug
+                         # st.write(f"✅ Debug: Added result {i} (Score: {dist:.4f} >= {threshold}) - Source: {doc.get('source', 'N/A')}") # Debug
+                     # else:
+                         # st.write(f"📉 Debug: Result {i} below threshold ({dist:.4f} < {threshold})") # Debug
                  else:
                      # This should ideally not happen if index and metadata are in sync
                      st.warning(f"🚨 Debug: Result index {idx} is out of bounds for metadata (length {len(metadata)}). Index might be corrupted or out of sync!") # Debug
@@ -568,7 +592,7 @@ def search_documents(query, k=5, threshold=0.7):
     # Sort results by score (descending) before returning
     results.sort(key=lambda x: x.get('score', 0), reverse=True)
 
-    st.write(f"--- Debug: Exiting search_documents - Found {len(results)} results passing threshold ---") # Debug
+    # st.write(f"--- Debug: Exiting search_documents - Found {len(results)} results passing threshold ---") # Debug
     return results
 
 
@@ -732,20 +756,20 @@ Do not add any information not present in the excerpts.
 **Answer:**
 [Your direct answer based *only* on the excerpts, or the "cannot answer" statement.]
 """
-            st.write("--- Debug: Prompt sent to LLM (showing first 500 chars) ---") # Debug
-            st.text(prompt[:500] + "...") # Debug
-            st.write("--- End Debug Prompt ---") # Debug
+            # st.write("--- Debug: Prompt sent to LLM (showing first 500 chars) ---") # Debug
+            # st.text(prompt[:500] + "...") # Debug
+            # st.write("--- End Debug Prompt ---") # Debug
 
         else:
             # No relevant documents found - Construct a simple response directly
             answer_data["answer"] = "I don't have specific information about this in the provided documents. Please consider consulting official clinical guidelines or pharmacist resources for accurate information."
-            st.warning("Debug: No relevant documents found by search.") # Debug
+            # st.warning("Debug: No relevant documents found by search.") # Debug
             # Skip LLM call if no results
             return answer_data
 
 
         # --- Call LLM API ---
-        st.write(f"Debug: Calling LLM model: {model} with temp={temp}") # Debug
+        # st.write(f"Debug: Calling LLM model: {model} with temp={temp}") # Debug
         response = client.chat.completions.create(
             model=model,
             messages=[
@@ -757,9 +781,9 @@ Do not add any information not present in the excerpts.
         )
 
         answer = response.choices[0].message.content
-        st.write("--- Debug: Raw LLM Response ---") # Debug
-        st.text(answer) # Debug
-        st.write("--- End Debug LLM Response ---") # Debug
+        # st.write("--- Debug: Raw LLM Response ---") # Debug
+        # st.text(answer) # Debug
+        # st.write("--- End Debug LLM Response ---") # Debug
 
         # Update answer data
         answer_data["answer"] = answer.strip()
@@ -850,9 +874,7 @@ def feedback_ui(question_id):
 
     # Use unique keys based on question_id for state isolation
     feedback_state_key = f"feedback_state_{question_id}"
-    rating_key = f"rating_{question_id}"
     comment_key = f"comment_{question_id}"
-    submitted_key = f"submitted_{question_id}"
 
     # Initialize state for this specific feedback instance if not present
     if feedback_state_key not in st.session_state:
@@ -863,7 +885,7 @@ def feedback_ui(question_id):
         st.success("✅ Thank you for your feedback on this answer!")
         return
 
-    with st.expander("📊 Rate this answer", expanded=True): # Keep expanded until submitted
+    with st.expander("📊 Rate this answer", expanded=not st.session_state[feedback_state_key]["submitted"]): # Keep expanded until submitted
         st.write("Your feedback helps improve PharmInsight!")
 
         cols = st.columns(3)
@@ -872,15 +894,17 @@ def feedback_ui(question_id):
         # Display buttons and update rating state on click
         for r, label in rating_buttons.items():
             button_key = f"rate_{r}_{question_id}"
-            if cols[r-1].button(label, key=button_key, use_container_width=True):
+            # Highlight selected button
+            button_type = "primary" if st.session_state[feedback_state_key].get("rating") == r else "secondary"
+            if cols[r-1].button(label, key=button_key, use_container_width=True, type=button_type):
                 st.session_state[feedback_state_key]["rating"] = r
-                # Rerun to update the UI showing the comment box
+                # Rerun to update the UI showing the comment box / highlighting
                 st.rerun()
 
         # Show comment area and submit button if a rating is selected
         selected_rating = st.session_state[feedback_state_key].get("rating")
         if selected_rating:
-            st.write(f"You selected: **{rating_buttons[selected_rating]}**")
+            # st.write(f"You selected: **{rating_buttons[selected_rating]}**") # Redundant with button highlight
             comment = st.text_area("Additional comments (optional)", key=comment_key)
 
             if st.button("Submit Feedback", key=f"submit_btn_{question_id}"):
@@ -975,20 +999,20 @@ def initialize_session_state():
         "temperature": 0.2,
         "include_explanation": True,
         "current_query": None, # Used for re-running searches
-        # Admin page states
-        "show_reset_password": False,
-        "show_change_role": False,
-        "show_delete_user": False,
+        # Admin page states (managed locally now with unique keys)
+        # "show_reset_password": False, # Removed
+        # "show_change_role": False, # Removed
+        # "show_delete_user": False, # Removed
+        "faiss_index": None, # Cache for loaded index
+        "index_metadata": None, # Cache for loaded metadata
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
     # Attempt to load API key early if not already set
-    if not st.session_state.get("openai_api_key"):
-         client = get_openai_client() # This function handles env/secrets logic
-         # We don't strictly need the client object here, just trigger the key load
-         # The key is stored in session_state by get_openai_client if found
+    # if not st.session_state.get("openai_api_key"):
+    #      get_openai_client() # This function handles env/secrets logic and stores in session_state
 
 
 def is_admin():
@@ -1014,8 +1038,12 @@ def render_sidebar():
                 username = st.session_state.get("username", "unknown_user")
                 log_action(username, "logout", "User logged out")
                 # Reset session state completely on logout
-                for key in list(st.session_state.keys()):
-                     del st.session_state[key]
+                # Keep track of keys to delete
+                keys_to_delete = list(st.session_state.keys())
+                for key in keys_to_delete:
+                     # Avoid deleting internal Streamlit keys if any start with '_'
+                     if not key.startswith('_'):
+                          del st.session_state[key]
                 # Re-initialize with defaults, setting page to login
                 initialize_session_state()
                 st.session_state["page"] = "login"
@@ -1056,15 +1084,27 @@ def render_sidebar():
 
             # OpenAI API Key Setting (Allow override)
             with st.expander("API Key"):
-                 current_key = st.session_state.get("openai_api_key", "")
-                 new_key = st.text_input("OpenAI API Key", value=current_key, type="password", key="api_key_input", help="Overrides environment/secrets if set.")
-                 if new_key != current_key and new_key: # Update only if changed and not empty
+                 # Use a separate key for the input widget to avoid conflicts
+                 api_key_input_value = st.session_state.get("openai_api_key", "")
+                 new_key = st.text_input("OpenAI API Key", value=api_key_input_value, type="password", key="api_key_input_widget", help="Overrides environment/secrets if set.")
+                 # Update session state only if the input value changes and is not empty
+                 if new_key != api_key_input_value and new_key:
                       st.session_state["openai_api_key"] = new_key
                       st.success("API Key updated in session.")
-                      # Optionally re-validate client
-                      get_openai_client() # Attempt validation
-                 elif not current_key and not new_key:
-                      st.warning("API Key not set.")
+                      # Clear cached client and index to force re-validation/reload on next use
+                      if "faiss_index" in st.session_state: del st.session_state["faiss_index"]
+                      if "index_metadata" in st.session_state: del st.session_state["index_metadata"]
+                      # Attempt re-validation immediately
+                      get_openai_client()
+                      st.rerun() # Rerun to reflect potential changes (e.g., error messages)
+                 elif not new_key:
+                      # If user clears the key, remove it from session state
+                      if "openai_api_key" in st.session_state:
+                           del st.session_state["openai_api_key"]
+                      st.warning("API Key cleared from session.")
+                      # Clear cached client and index
+                      if "faiss_index" in st.session_state: del st.session_state["faiss_index"]
+                      if "index_metadata" in st.session_state: del st.session_state["index_metadata"]
 
 
             with st.expander("Search Settings"):
@@ -1073,10 +1113,16 @@ def render_sidebar():
                 st.slider("Similarity threshold", min_value=0.0, max_value=1.0, value=st.session_state.get("similarity_threshold", 0.75), step=0.05, key="similarity_threshold", format="%.2f")
 
             with st.expander("Model Settings"):
+                available_models = ["gpt-3.5-turbo", "gpt-4-turbo", "gpt-4o"] # Add more models if needed
+                current_model = st.session_state.get("llm_model", "gpt-3.5-turbo")
+                # Handle case where saved model is no longer available
+                if current_model not in available_models:
+                     current_model = available_models[0] # Default to first available
+                     st.session_state["llm_model"] = current_model
                 st.selectbox(
                     "LLM Model",
-                    ["gpt-3.5-turbo", "gpt-4-turbo", "gpt-4o"], # Add more models if needed
-                    index=["gpt-3.5-turbo", "gpt-4-turbo", "gpt-4o"].index(st.session_state.get("llm_model", "gpt-3.5-turbo")), # Find index safely
+                    available_models,
+                    index=available_models.index(current_model),
                     key="llm_model"
                 )
                 st.slider("Temperature (Creativity)", min_value=0.0, max_value=1.0, value=st.session_state.get("temperature", 0.2), step=0.1, key="temperature", format="%.1f")
@@ -1106,6 +1152,7 @@ def login_form():
                 else:
                     authenticated, role = verify_password(username, password)
                     if authenticated:
+                        # Set auth state AFTER verification
                         st.session_state["authenticated"] = True
                         st.session_state["username"] = username
                         st.session_state["role"] = role
@@ -1113,7 +1160,7 @@ def login_form():
                         st.success(f"Login successful! Welcome back, {username}.")
                         # Short delay before rerun can improve UX
                         import time
-                        time.sleep(1)
+                        time.sleep(0.5) # Shorter delay
                         st.rerun()
                     else:
                         st.error("Invalid username or password.")
@@ -1155,11 +1202,14 @@ def main_page():
 
     # --- Search Input Area ---
     # Use a form to handle query submission and clearing better
+    # Use st.session_state.get to initialize the text input value, allowing it to be potentially pre-filled
+    initial_query = st.session_state.get("query_input_value", "")
     with st.form(key="search_form"):
         query = st.text_input(
             "Ask a clinical question:",
             placeholder="e.g., What is the recommended monitoring for amiodarone?",
-            key="query_input"
+            key="query_input_widget", # Use a different key for the widget itself
+            value=initial_query # Set the initial value
         )
         search_col, clear_col = st.columns([4, 1])
         with search_col:
@@ -1168,37 +1218,54 @@ def main_page():
              clear_submitted = st.form_submit_button("Clear", use_container_width=True)
 
         if clear_submitted:
-             # Clear the input field by resetting its key in session state
-             st.session_state.query_input = ""
-             # Clear any previous results display area (if managed by state)
-             if 'last_search_result' in st.session_state:
-                 del st.session_state['last_search_result']
+             # Clear the stored value and the trigger
+             st.session_state.query_input_value = ""
+             if "current_query" in st.session_state: del st.session_state["current_query"]
+             if 'last_search_result' in st.session_state: del st.session_state['last_search_result']
              st.rerun() # Rerun to clear the text input
 
         if search_submitted and query:
-            # Store query for potential re-use or history display
-            st.session_state["current_query"] = query
-            # Trigger processing below the form
+            # Store query for processing and potentially pre-filling next time
+            st.session_state["query_input_value"] = query
+            st.session_state["current_query"] = query # Set the trigger
+            # Clear previous results before starting new search
+            if 'last_search_result' in st.session_state: del st.session_state['last_search_result']
+            st.rerun() # Rerun to trigger processing below
 
     # --- Display Recent Searches (Optional) ---
     if "user_history" in st.session_state and st.session_state["user_history"]:
-        recent_searches = list(reversed([h["query"] for h in st.session_state["user_history"]]))[:3] # Get last 3 unique might be better
-        if recent_searches:
+        # Get unique recent searches, preserving order (most recent first)
+        unique_recent = []
+        seen = set()
+        for h in reversed(st.session_state["user_history"]):
+            q = h["query"]
+            if q not in seen:
+                unique_recent.append(q)
+                seen.add(q)
+                if len(unique_recent) >= 3: # Limit to 3 unique recent searches
+                    break
+
+        if unique_recent:
             st.caption("Recent searches:")
-            cols = st.columns(len(recent_searches))
-            for i, recent_q in enumerate(recent_searches):
+            cols = st.columns(len(unique_recent))
+            for i, recent_q in enumerate(unique_recent):
                 with cols[i]:
-                    if st.button(f"'{recent_q[:30]}...'" if len(recent_q) > 30 else f"'{recent_q}'", key=f"recent_{i}", help=f"Search again for: {recent_q}"):
-                        # Set query_input and trigger form submission logic via rerun
-                        st.session_state.query_input = recent_q
-                        st.session_state["current_query"] = recent_q # Ensure current_query is set
+                    button_text = f"'{recent_q[:25]}...'" if len(recent_q) > 25 else f"'{recent_q}'"
+                    if st.button(button_text, key=f"recent_{i}", help=f"Search again for: {recent_q}"):
+                        # Set the value for the text input for the *next* run
+                        st.session_state.query_input_value = recent_q
+                        # Set the trigger for processing
+                        st.session_state["current_query"] = recent_q
+                        # Clear previous results before starting new search
+                        if 'last_search_result' in st.session_state: del st.session_state['last_search_result']
                         st.rerun() # Rerun will process the query below
+
 
     # --- Process Search and Display Results ---
     # Check if a search was triggered (either by button or recent search click)
     if st.session_state.get("current_query"):
-        current_query = st.session_state["current_query"]
-        # Clear the trigger state after processing once
+        current_query_to_process = st.session_state["current_query"]
+        # Clear the trigger state immediately after reading it
         st.session_state["current_query"] = None
 
         st.markdown("---") # Separator
@@ -1208,15 +1275,18 @@ def main_page():
             include_explanation = st.session_state.get("include_explanation", True)
             temperature = st.session_state.get("temperature", 0.2)
 
-            # Generate answer
+            # Generate answer using the query we stored
             result_data = generate_answer(
-                current_query,
+                current_query_to_process,
                 model=llm_model,
                 include_explanation=include_explanation,
                 temp=temperature
             )
             # Store result in session state to persist across reruns if needed
             st.session_state['last_search_result'] = result_data
+            # Rerun needed to display the results cleanly after spinner
+            st.rerun()
+
 
     # Display the result if it exists in session state
     if 'last_search_result' in st.session_state:
@@ -1243,7 +1313,12 @@ def main_page():
             with st.expander("📄 Sources Used", expanded=False): # Start collapsed
                 for idx, doc in enumerate(result_data["sources"]):
                     score = doc.get("score", 0.0)
-                    score_percent = int(score * 100)
+                    # Ensure score is float before formatting
+                    try:
+                        score_percent = int(float(score) * 100)
+                    except (ValueError, TypeError):
+                        score_percent = 0 # Default if score is invalid
+
                     source_name = doc.get('source', 'Unknown Source')
                     category = doc.get('category', 'N/A')
                     text_snippet = doc.get("text", "")
@@ -1356,6 +1431,7 @@ def profile_page():
                          st.error("New password must be at least 6 characters long.")
                     else:
                         # Verify current password first (using the verify function for consistency)
+                        # Pass the current connection to avoid re-opening/closing issues during verify
                         verified, _ = verify_password(username, current_pwd)
                         if not verified:
                              # verify_password already logs the failed attempt
@@ -1383,7 +1459,7 @@ def profile_page():
         with col2:
             # --- Display Activity Stats ---
             st.subheader("Your Activity")
-            st.metric("Questions Asked", question_count)
+            st.metric("Questions Answered", question_count)
             st.metric("Searches Made", search_count)
             st.metric("Feedback Given", feedback_count)
 
@@ -1495,7 +1571,7 @@ def history_page():
                              st.caption(f"{ts} {results_text}")
                         with col3:
                              if st.button("Search Again", key=f"again_{row['history_id']}"):
-                                 st.session_state["query_input"] = row['query'] # Pre-fill input
+                                 st.session_state["query_input_value"] = row['query'] # Pre-fill input for next run
                                  st.session_state["current_query"] = row['query'] # Set trigger
                                  st.session_state["page"] = "main"
                                  st.rerun()
@@ -1514,7 +1590,7 @@ def history_page():
                             st.caption(f"Model: {row['model_used']} | Sources: {row['sources']}")
                             # Add button to ask again?
                             if st.button("Ask Again", key=f"ask_again_{row['question_id']}"):
-                                st.session_state["query_input"] = row['query']
+                                st.session_state["query_input_value"] = row['query']
                                 st.session_state["current_query"] = row['query']
                                 st.session_state["page"] = "main"
                                 st.rerun()
@@ -1619,7 +1695,10 @@ def admin_docs_page():
                                         ac.execute("UPDATE documents SET is_active = 0 WHERE doc_id = ?", (selected_doc_id,))
                                         action_conn.commit()
                                     log_action(st.session_state['username'], "deactivate_document", f"Deactivated document ID: {selected_doc_id} ({filename})")
-                                    st.success(f"Document '{filename}' deactivated.")
+                                    # Clear cached index on change
+                                    if "faiss_index" in st.session_state: del st.session_state["faiss_index"]
+                                    if "index_metadata" in st.session_state: del st.session_state["index_metadata"]
+                                    st.success(f"Document '{filename}' deactivated. Index will update on next search/load.")
                                     st.rerun()
                                 except Exception as e:
                                     st.error(f"Error deactivating document: {e}")
@@ -1631,7 +1710,10 @@ def admin_docs_page():
                                         ac.execute("UPDATE documents SET is_active = 1 WHERE doc_id = ?", (selected_doc_id,))
                                         action_conn.commit()
                                     log_action(st.session_state['username'], "activate_document", f"Activated document ID: {selected_doc_id} ({filename})")
-                                    st.success(f"Document '{filename}' activated.")
+                                     # Clear cached index on change
+                                    if "faiss_index" in st.session_state: del st.session_state["faiss_index"]
+                                    if "index_metadata" in st.session_state: del st.session_state["index_metadata"]
+                                    st.success(f"Document '{filename}' activated. Index will update on next search/load.")
                                     st.rerun()
                                 except Exception as e:
                                     st.error(f"Error activating document: {e}")
@@ -1650,7 +1732,10 @@ def admin_docs_page():
                                         ac.execute("DELETE FROM documents WHERE doc_id = ?", (selected_doc_id,))
                                         action_conn.commit()
                                     log_action(st.session_state['username'], "delete_document", f"Deleted document ID: {selected_doc_id} ({filename})")
-                                    st.success(f"Document '{filename}' and its chunks deleted.")
+                                     # Clear cached index on change
+                                    if "faiss_index" in st.session_state: del st.session_state["faiss_index"]
+                                    if "index_metadata" in st.session_state: del st.session_state["index_metadata"]
+                                    st.success(f"Document '{filename}' and its chunks deleted. Index will update on next search/load.")
                                     st.rerun()
                                 except Exception as e:
                                     st.error(f"Error deleting document: {e}")
@@ -1768,10 +1853,12 @@ def admin_docs_page():
                                      if chunk_text: # Only add non-empty chunks
                                           chunks.append(chunk_text)
                                      # Move start index for next chunk, considering overlap
-                                     start_index += chunk_size - chunk_overlap
-                                     # Ensure start_index doesn't go backward if overlap > size
-                                     if chunk_overlap >= chunk_size:
-                                          start_index = end_index # Simple non-overlapping if overlap >= size
+                                     next_start = start_index + chunk_size - chunk_overlap
+                                     # Prevent infinite loop if step is non-positive
+                                     if next_start <= start_index:
+                                         next_start = start_index + 1
+                                     start_index = next_start
+
 
                                  if not chunks:
                                       st.warning(f"⚠️ No chunks created for {file.name}. Skipping.")
@@ -1812,6 +1899,10 @@ def admin_docs_page():
                                      log_action(uploader, "upload_document", f"Uploaded '{file.name}' (ID: {doc_id}) with {len(chunks)} chunks.")
                                      st.success(f"✅ Successfully processed and stored: {file.name} ({len(chunks)} chunks)")
                                      files_processed += 1
+                                     # Clear cached index after successful upload
+                                     if "faiss_index" in st.session_state: del st.session_state["faiss_index"]
+                                     if "index_metadata" in st.session_state: del st.session_state["index_metadata"]
+
 
                                  except sqlite3.Error as db_err:
                                      st.error(f"❌ Database error for {file.name}: {db_err}")
@@ -1851,9 +1942,14 @@ def admin_docs_page():
                       st.error("❌ Cannot rebuild index: OpenAI API key is missing or invalid.")
                  else:
                      with st.spinner("🛠️ Rebuilding search index... This may take a while."):
+                         # Clear cached index before rebuild
+                         if "faiss_index" in st.session_state: del st.session_state["faiss_index"]
+                         if "index_metadata" in st.session_state: del st.session_state["index_metadata"]
                          success, count = rebuild_index_from_db() # Call the rebuild function
                          if success:
                              st.success(f"✅ Search index rebuilt successfully with {count} document chunks.")
+                             # Attempt to reload index into cache immediately after successful rebuild
+                             load_search_index()
                          else:
                              st.error("❌ Failed to rebuild search index. Check logs or previous errors.")
 
@@ -1918,10 +2014,11 @@ def admin_users_page():
                     with col1:
                         # --- Reset Password ---
                         st.write("**Reset Password**")
-                        if st.button("Reset Password", key=f"reset_pwd_{selected_username}", disabled=is_self):
-                            st.session_state[f"show_reset_{selected_username}"] = True # Use unique state key
+                        reset_pwd_key = f"show_reset_{selected_username}"
+                        if st.button("Reset Password", key=f"reset_pwd_btn_{selected_username}", disabled=is_self):
+                            st.session_state[reset_pwd_key] = True # Use unique state key
 
-                        if st.session_state.get(f"show_reset_{selected_username}", False):
+                        if st.session_state.get(reset_pwd_key, False):
                             with st.form(f"reset_pwd_form_{selected_username}"):
                                 new_pwd = st.text_input("New Password", type="password", key=f"new_pwd_{selected_username}")
                                 confirm_pwd = st.text_input("Confirm New Password", type="password", key=f"confirm_pwd_{selected_username}")
@@ -1942,7 +2039,7 @@ def admin_users_page():
                                                 action_conn.commit()
                                             log_action(st.session_state['username'], "reset_password", f"Admin reset password for user: {selected_username}")
                                             st.success(f"Password reset successfully for {selected_username}.")
-                                            st.session_state[f"show_reset_{selected_username}"] = False # Hide form
+                                            st.session_state[reset_pwd_key] = False # Hide form
                                             st.rerun()
                                         except Exception as e:
                                             st.error(f"Error resetting password: {e}")
@@ -1970,7 +2067,8 @@ def admin_users_page():
                         # --- Delete User ---
                         st.write("**Delete User**")
                         st.error("⚠️ Deletion is permanent!")
-                        if st.checkbox(f"Confirm deletion?", key=f"del_confirm_{selected_username}", disabled=is_self):
+                        delete_confirm_key = f"del_confirm_{selected_username}"
+                        if st.checkbox(f"Confirm deletion?", key=delete_confirm_key, disabled=is_self):
                             if st.button("DELETE USER", type="primary", key=f"del_user_{selected_username}", disabled=is_self):
                                 try:
                                     with sqlite3.connect(DB_PATH, timeout=20.0) as action_conn:
@@ -2007,23 +2105,25 @@ def admin_users_page():
                          st.error("Password must be at least 6 characters.")
                     else:
                         try:
-                            # Check if username exists
-                            cursor = conn.cursor()
-                            cursor.execute("SELECT 1 FROM users WHERE username = ?", (new_username,))
-                            if cursor.fetchone():
-                                st.error("Username already exists.")
-                            else:
-                                # Hash password and insert
-                                salt = "salt_key" # Ensure consistency
-                                new_hash = hashlib.sha256(f"{new_password}:{salt}".encode()).hexdigest()
-                                cursor.execute(
-                                    "INSERT INTO users (username, password_hash, role, email, full_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                                    (new_username, new_hash, new_role, new_email or None, new_full_name or None, datetime.datetime.now().isoformat())
-                                )
-                                conn.commit()
-                                log_action(st.session_state['username'], "create_user", f"Admin created new user: {new_username} (Role: {new_role})")
-                                st.success(f"User '{new_username}' created successfully!")
-                                # Clear form? Usually happens on rerun.
+                            # Use a separate connection for the insert transaction
+                            with sqlite3.connect(DB_PATH, timeout=20.0) as create_conn:
+                                create_c = create_conn.cursor()
+                                # Check if username exists
+                                create_c.execute("SELECT 1 FROM users WHERE username = ?", (new_username,))
+                                if create_c.fetchone():
+                                    st.error("Username already exists.")
+                                else:
+                                    # Hash password and insert
+                                    salt = "salt_key" # Ensure consistency
+                                    new_hash = hashlib.sha256(f"{new_password}:{salt}".encode()).hexdigest()
+                                    create_c.execute(
+                                        "INSERT INTO users (username, password_hash, role, email, full_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                                        (new_username, new_hash, new_role, new_email or None, new_full_name or None, datetime.datetime.now().isoformat())
+                                    )
+                                    create_conn.commit()
+                                    log_action(st.session_state['username'], "create_user", f"Admin created new user: {new_username} (Role: {new_role})")
+                                    st.success(f"User '{new_username}' created successfully!")
+                                    st.rerun() # Rerun to update user list
                         except sqlite3.IntegrityError as ie:
                              # Catch potential unique constraint errors (like email)
                              st.error(f"Database error: Could not create user. Email might already be in use. ({ie})")
@@ -2085,10 +2185,8 @@ def admin_analytics_page():
                 (SELECT COUNT(*) FROM users) as users_count,
                 (SELECT COUNT(*) FROM documents WHERE is_active = 1) as active_docs_count,
                 (SELECT COUNT(*) FROM documents WHERE is_active = 0) as inactive_docs_count,
-                (SELECT COUNT(DISTINCT doc_id) FROM chunks
-                 JOIN documents ON chunks.doc_id = documents.doc_id WHERE documents.is_active = 1) as indexed_docs_count,
-                (SELECT COUNT(*) FROM chunks
-                 JOIN documents ON chunks.doc_id = documents.doc_id WHERE documents.is_active = 1) as active_chunks_count,
+                (SELECT COUNT(DISTINCT d.doc_id) FROM chunks c JOIN documents d ON c.doc_id = d.doc_id WHERE d.is_active = 1) as indexed_docs_count,
+                (SELECT COUNT(*) FROM chunks c JOIN documents d ON c.doc_id = d.doc_id WHERE d.is_active = 1) as active_chunks_count,
                 (SELECT COUNT(*) FROM qa_pairs) as qa_count,
                 (SELECT COUNT(*) FROM search_history) as searches_count,
                 (SELECT COUNT(*) FROM feedback) as feedback_count
@@ -2098,16 +2196,16 @@ def admin_analytics_page():
 
             if counts is not None:
                 col1, col2, col3 = st.columns(3)
-                col1.metric("Total Users", counts['users_count'])
-                col1.metric("Active Documents", counts['active_docs_count'])
-                col1.metric("Inactive Documents", counts['inactive_docs_count'])
+                col1.metric("Total Users", int(counts.get('users_count', 0)))
+                col1.metric("Active Documents", int(counts.get('active_docs_count', 0)))
+                col1.metric("Inactive Documents", int(counts.get('inactive_docs_count', 0)))
 
-                col2.metric("Documents in Index", counts['indexed_docs_count']) # Docs with active chunks
-                col2.metric("Chunks in Index", counts['active_chunks_count']) # Active chunks
-                col2.metric("Questions Answered", counts['qa_count'])
+                col2.metric("Documents in Index", int(counts.get('indexed_docs_count', 0))) # Docs with active chunks
+                col2.metric("Chunks in Index", int(counts.get('active_chunks_count', 0))) # Active chunks
+                col2.metric("Questions Answered", int(counts.get('qa_count', 0)))
 
-                col3.metric("Total Searches", counts['searches_count'])
-                col3.metric("Feedback Entries", counts['feedback_count'])
+                col3.metric("Total Searches", int(counts.get('searches_count', 0)))
+                col3.metric("Feedback Entries", int(counts.get('feedback_count', 0)))
             else:
                 st.warning("Could not fetch usage counts.")
 
@@ -2138,10 +2236,11 @@ def admin_analytics_page():
                 "SELECT COUNT(*) as total, AVG(rating) as avg_rating FROM feedback", conn
             )
             total_fb = feedback_stats['total'].iloc[0] if not feedback_stats.empty else 0
-            avg_rating = feedback_stats['avg_rating'].iloc[0] if not feedback_stats.empty and feedback_stats['avg_rating'].iloc[0] is not None else 0
+            avg_rating = feedback_stats['avg_rating'].iloc[0] if not feedback_stats.empty and pd.notna(feedback_stats['avg_rating'].iloc[0]) else 0
+
 
             col1, col2 = st.columns(2)
-            col1.metric("Total Feedback Entries", total_fb)
+            col1.metric("Total Feedback Entries", int(total_fb))
             col2.metric("Average Rating", f"{avg_rating:.2f} / 3.00" if total_fb > 0 else "N/A")
 
             if total_fb > 0:
@@ -2150,6 +2249,11 @@ def admin_analytics_page():
                 )
                 rating_labels = {1: "1 - Not Helpful", 2: "2 - Somewhat", 3: "3 - Very Helpful"}
                 rating_dist['Rating Label'] = rating_dist['rating'].map(rating_labels)
+
+                # Ensure all rating categories exist for consistent charting
+                full_rating_dist = pd.DataFrame({'Rating Label': list(rating_labels.values())})
+                rating_dist = pd.merge(full_rating_dist, rating_dist, on='Rating Label', how='left').fillna(0)
+
                 st.bar_chart(rating_dist.set_index('Rating Label')['count'], use_container_width=True)
 
                 st.divider()
@@ -2246,21 +2350,37 @@ def admin_analytics_page():
 
 # --- Main App Logic ---
 
+# Set page config for wider layout
+st.set_page_config(layout="wide")
+
+
 # Attempt DB initialization (safe to call multiple times)
 if init_database():
     # Initialize session state if DB init is successful
     initialize_session_state()
 
-    # Load index early to provide feedback
-    load_search_index()
+    # Attempt to load API key early if not already set
+    # This helps ensure the API key status is reflected early in the sidebar
+    if not st.session_state.get("openai_api_key"):
+         get_openai_client()
 
-    # Render sidebar based on auth state AFTER initialization
+    # Attempt to load index early if authenticated (provides feedback in sidebar)
+    # Do this *after* API key check, as rebuild might need the key
+    if st.session_state.get("authenticated"):
+        load_search_index()
+
+    # Render sidebar (content depends on auth state)
     render_sidebar()
 
     # Page routing
     page = st.session_state.get("page", "login") # Default to login
 
+    # Main content area
     if not st.session_state.get("authenticated"):
+        # If not authenticated, force page to login regardless of state
+        if page != "login":
+             st.session_state.page = "login"
+             st.rerun() # Rerun to show login page
         login_form()
     elif page == "main":
         main_page()
@@ -2275,10 +2395,10 @@ if init_database():
     elif page == "admin_analytics":
         admin_analytics_page()
     else:
-        # Fallback to main page if route is unknown
+        # Fallback to main page if route is unknown and authenticated
         st.warning(f"Unknown page '{page}'. Redirecting to home.")
         st.session_state["page"] = "main"
-        main_page()
+        st.rerun() # Rerun to show main page
 
 else:
     # Critical DB Error on startup
