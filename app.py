@@ -3,6 +3,12 @@ PharmInsight - A clinical knowledge base for pharmacists.
 
 This is the main entry point for the PharmInsight application.
 """
+import os
+from openai import OpenAI
+import faiss
+import numpy as np
+import pickle
+import json
 import streamlit as st
 import sys
 import os
@@ -11,6 +17,8 @@ import hashlib
 import datetime
 import uuid
 import pandas as pd
+from io import BytesIO
+from PyPDF2 import PdfReader
 
 # Add the current directory to Python's path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -18,6 +26,433 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # Constants
 APP_VERSION = "2.1.0"
 DB_PATH = "pharminsight.db"
+INDEX_PATH = "vector.index"
+DOCS_METADATA_PATH = "docs_metadata.pkl"
+SIMILARITY_THRESHOLD = 0.75
+K_RETRIEVE = 5
+
+# Add these new functions for the full functionality
+
+def get_openai_client():
+    """Get an OpenAI client with proper error handling"""
+    try:
+        api_key = st.session_state.get("openai_api_key") or os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            st.error("❌ OPENAI_API_KEY is missing. Please add it in your environment or settings.")
+            st.stop()
+            
+        client = OpenAI(api_key=api_key)
+        return client
+    except Exception as e:
+        st.error(f"Error initializing OpenAI client: {e}")
+        st.stop()
+
+def get_embedding(text, model="text-embedding-3-small"):
+    """Get embedding vector for text using OpenAI API"""
+    client = get_openai_client()
+    
+    try:
+        # Clean and prepare text
+        text = text.replace("\n", " ").strip()
+        
+        # Handle empty text
+        if not text:
+            return np.zeros(1536, dtype=np.float32)  # Default dimension for embeddings
+            
+        response = client.embeddings.create(
+            input=[text],
+            model=model
+        )
+        embedding = np.array(response.data[0].embedding, dtype=np.float32)
+        
+        # Normalize for cosine similarity
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+            
+        return embedding
+        
+    except Exception as e:
+        st.error(f"Error creating embedding: {e}")
+        raise
+
+def rebuild_index_from_db():
+    """Rebuild the search index from database records"""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=20.0)
+        c = conn.cursor()
+        
+        # Get all active document chunks
+        c.execute('''
+        SELECT c.chunk_id, c.text, d.filename, d.category, d.doc_id
+        FROM chunks c
+        JOIN documents d ON c.doc_id = d.doc_id
+        WHERE d.is_active = 1
+        ''')
+        
+        results = c.fetchall()
+        conn.close()
+        
+        all_embeddings = []
+        metadata = []
+        
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        for i, (chunk_id, text, filename, category, doc_id) in enumerate(results):
+            status_text.text(f"Processing chunk {i+1}/{len(results)}")
+            progress_bar.progress((i + 1) / len(results))
+            
+            # Generate embedding for each chunk
+            embedding = get_embedding(text)
+            all_embeddings.append(embedding)
+            
+            # Create metadata entry
+            meta = {
+                "chunk_id": chunk_id,
+                "text": text,
+                "source": filename,
+                "category": category,
+                "doc_id": doc_id
+            }
+            metadata.append(meta)
+        
+        # Create and save FAISS index
+        if all_embeddings:
+            all_embeddings = np.array(all_embeddings, dtype=np.float32)
+            dimension = all_embeddings.shape[1]
+            
+            index = faiss.IndexFlatIP(dimension)  # Inner product for cosine similarity
+            
+            # Normalize vectors for cosine similarity
+            faiss.normalize_L2(all_embeddings)
+            index.add(all_embeddings)
+            
+            # Save index and metadata
+            faiss.write_index(index, INDEX_PATH)
+            with open(DOCS_METADATA_PATH, "wb") as f:
+                pickle.dump(metadata, f)
+                
+            return True, len(metadata)
+        
+        return False, 0
+    except Exception as e:
+        st.error(f"Error rebuilding index: {str(e)}")
+        return False, 0
+
+def load_search_index():
+    """Load the search index and metadata"""
+    try:
+        if os.path.exists(INDEX_PATH) and os.path.exists(DOCS_METADATA_PATH):
+            index = faiss.read_index(INDEX_PATH)
+            with open(DOCS_METADATA_PATH, "rb") as f:
+                metadata = pickle.load(f)
+            return index, metadata
+        else:
+            # Try to rebuild the index
+            success, _ = rebuild_index_from_db()
+            if success:
+                index = faiss.read_index(INDEX_PATH)
+                with open(DOCS_METADATA_PATH, "rb") as f:
+                    metadata = pickle.load(f)
+                return index, metadata
+    except Exception as e:
+        st.error(f"Error loading search index: {e}")
+        
+    # Return empty index and metadata as fallback
+    dimension = 1536  # Default for OpenAI embeddings
+    empty_index = faiss.IndexFlatIP(dimension)
+    return empty_index, []
+
+def search_documents(query, k=5, threshold=0.7):
+    """Search for relevant documents."""
+    # Load index and metadata
+    index, metadata = load_search_index()
+    
+    if index.ntotal == 0 or not metadata:
+        return []
+    
+    # Get query embedding
+    query_embedding = get_embedding(query)
+    query_embedding = query_embedding.reshape(1, -1)
+    
+    # Normalize for cosine similarity
+    faiss.normalize_L2(query_embedding)
+    
+    # Search the index
+    k = min(k, len(metadata))  # Don't request more results than we have
+    distances, indices = index.search(query_embedding, k)
+    
+    results = []
+    for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
+        if idx < len(metadata) and dist >= threshold:
+            doc = metadata[idx].copy()
+            doc["score"] = float(dist)
+            results.append(doc)
+    
+    return results
+
+def generate_answer(query, model="gpt-3.5-turbo", include_explanation=True, temp=0.2):
+    """Generate an answer to a query based on retrieved documents."""
+    client = get_openai_client()
+    
+    # Record search in history
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=20.0)
+        c = conn.cursor()
+        
+        history_id = str(uuid.uuid4())
+        c.execute(
+            "INSERT INTO search_history VALUES (?, ?, ?, ?, ?)",
+            (
+                history_id,
+                st.session_state["username"],
+                query,
+                datetime.datetime.now().isoformat(),
+                0  # Will update this with results count
+            )
+        )
+        conn.commit()
+        
+        # Update user history in session state
+        if "user_history" not in st.session_state:
+            st.session_state["user_history"] = []
+        st.session_state["user_history"].append({
+            "query": query,
+            "timestamp": datetime.datetime.now().isoformat()
+        })
+    except Exception as e:
+        st.error(f"Error recording search history: {str(e)}")
+    
+    # Search for relevant documents
+    results = search_documents(query, k=K_RETRIEVE, threshold=SIMILARITY_THRESHOLD)
+    
+    # Update search history with result count
+    try:
+        c.execute(
+            "UPDATE search_history SET num_results = ? WHERE history_id = ?",
+            (len(results), history_id)
+        )
+        conn.commit()
+    except Exception as e:
+        st.error(f"Error updating search history: {str(e)}")
+    finally:
+        conn.close()
+    
+    # Initialize response structure
+    answer_data = {
+        "question_id": str(uuid.uuid4()),
+        "query": query,
+        "answer": "",
+        "sources": results,
+        "model": model,
+        "timestamp": datetime.datetime.now().isoformat()
+    }
+    
+    try:
+        if results:
+            # Prepare context from retrieved chunks
+            context_pieces = []
+            for result in results:
+                chunk = f"Source: {result['source']} (Category: {result.get('category', 'Uncategorized')})\n\n{result['text']}"
+                context_pieces.append(chunk)
+            
+            context = "\n\n---\n\n".join(context_pieces)
+            
+            # Build prompt
+            if include_explanation:
+                prompt = f"""
+You are a clinical expert assistant for pharmacists. Answer the following question based ONLY on the provided document excerpts. 
+If the document excerpts don't contain the information needed to answer the question, 
+say "I don't have enough information about this in the provided documents."
+
+**Document Excerpts:**
+{context}
+
+**Question:**
+{query}
+
+Provide your answer in this format:
+
+**Answer:**
+[A direct and concise answer to the question]
+
+**Explanation:**
+[A detailed explanation with specific information from the documents]
+
+**Sources:**
+[List the sources of information used]
+"""
+            else:
+                prompt = f"""
+You are a clinical expert assistant for pharmacists. Answer the following question based ONLY on the provided document excerpts.
+If the document excerpts don't contain the information needed to answer the question, 
+say "I don't have enough information about this in the provided documents."
+
+**Document Excerpts:**
+{context}
+
+**Question:**
+{query}
+
+Provide your answer in this format:
+
+**Answer:**
+[A direct and concise answer to the question]
+"""
+            answer_source = "Retrieved Documents"
+        else:
+            # No relevant documents found
+            prompt = f"""
+You are a clinical expert assistant for pharmacists. No relevant document was found for the following question:
+
+Question: {query}
+
+Please respond with:
+"I don't have specific information about this in the provided documents. Please consider consulting official clinical guidelines or pharmacist resources for accurate information."
+"""
+            answer_source = "No Relevant Documents"
+
+        # Generate the answer using the LLM
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are an expert clinical assistant for pharmacists."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=temp,
+            max_tokens=1000
+        )
+        
+        answer = response.choices[0].message.content
+        
+        # Update answer data
+        answer_data["answer"] = answer
+        answer_data["source_type"] = answer_source
+        
+        # Store the Q&A pair in database
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=20.0)
+            c = conn.cursor()
+            
+            c.execute(
+                "INSERT INTO qa_pairs VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    answer_data["question_id"],
+                    st.session_state["username"],
+                    answer_data["query"],
+                    answer_data["answer"],
+                    answer_data["timestamp"],
+                    json.dumps([s.get("source", "") for s in answer_data["sources"]]),
+                    answer_data["model"]
+                )
+            )
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            st.error(f"Error storing Q&A pair: {str(e)}")
+        
+        return answer_data
+            
+    except Exception as e:
+        error_message = f"Error generating answer: {str(e)}"
+        answer_data["answer"] = error_message
+        answer_data["source_type"] = "Error"
+        return answer_data
+
+def submit_feedback(question_id, rating, comment=None):
+    """Submit feedback for an answer"""
+    # Validate rating is in the 1-3 range
+    if rating < 1 or rating > 3:
+        st.error("Rating must be between 1 and 3")
+        return False
+        
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=20.0)
+        c = conn.cursor()
+        
+        feedback_id = str(uuid.uuid4())
+        
+        c.execute(
+            "INSERT INTO feedback VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                feedback_id,
+                question_id,
+                st.session_state["username"],
+                rating,
+                comment,
+                datetime.datetime.now().isoformat()
+            )
+        )
+        
+        conn.commit()
+        
+        log_action(
+            st.session_state["username"],
+            "submit_feedback",
+            f"User submitted feedback for question {question_id} with rating {rating}"
+        )
+        
+        conn.close()
+        return True
+    except Exception as e:
+        st.error(f"Error submitting feedback: {str(e)}")
+        return False
+
+def feedback_ui(question_id):
+    """Display feedback collection UI"""
+    st.divider()
+    
+    with st.expander("📊 Rate this answer", expanded=False):
+        st.write("Your feedback helps us improve the system")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        rating = None
+        
+        with col1:
+            if st.button("1 - Not Helpful", key=f"rate_1_{question_id}"):
+                rating = 1
+        with col2:
+            if st.button("2 - Somewhat Helpful", key=f"rate_2_{question_id}"):
+                rating = 2
+        with col3:
+            if st.button("3 - Very Helpful", key=f"rate_3_{question_id}"):
+                rating = 3
+                
+        if rating:
+            st.session_state["show_feedback_form"] = True
+            st.session_state["selected_rating"] = rating
+            
+        # Show comment field if a rating was selected
+        if st.session_state.get("show_feedback_form", False):
+            selected_rating = st.session_state.get("selected_rating", 2)
+            
+            # Show the selected rating
+            if selected_rating == 1:
+                st.write("You selected: Not Helpful")
+            elif selected_rating == 2:
+                st.write("You selected: Somewhat Helpful")
+            else:
+                st.write("You selected: Very Helpful")
+                
+            comments = st.text_area("Additional comments (optional)", key=f"comments_{question_id}")
+            
+            if st.button("Submit Feedback", key=f"submit_{question_id}"):
+                success = submit_feedback(
+                    question_id,
+                    selected_rating,
+                    comments
+                )
+                
+                if success:
+                    st.success("Thank you for your feedback!")
+                    # Reset the feedback state
+                    st.session_state["show_feedback_form"] = False
+                    st.session_state["selected_rating"] = None
+                else:
+                    st.error("Error submitting feedback. Please try again.")
 
 # Database initialization function
 def init_database():
@@ -221,6 +656,14 @@ def initialize_session_state():
         
     if "user_history" not in st.session_state:
         st.session_state["user_history"] = []
+    if "openai_api_key" not in st.session_state:
+        st.session_state["openai_api_key"] = os.getenv("OPENAI_API_KEY", "")
+    if "embedding_model" not in st.session_state:
+        st.session_state["embedding_model"] = "text-embedding-3-small"
+    if "show_feedback_form" not in st.session_state:
+        st.session_state["show_feedback_form"] = False
+    if "current_question_id" not in st.session_state:
+        st.session_state["current_question_id"] = None
         
     # Search settings
     if "k_retrieve" not in st.session_state:
@@ -367,21 +810,57 @@ def main_page():
     st.title("PharmInsight for Pharmacists")
     st.markdown("Ask questions related to clinical guidelines, drug information, or policies.")
     
-    # Simple check if database is initialized
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=20.0)
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM documents")
-        doc_count = c.fetchone()[0]
-        conn.close()
+    # Check if we have documents and index
+    index, metadata = load_search_index()
+    has_documents = index.ntotal > 0 and metadata
+    
+    if not has_documents:
+        st.warning("⚠️ No documents are currently available in the system. Please contact an administrator.")
         
-        if doc_count == 0:
-            st.warning("⚠️ No documents are currently available in the system. Please contact an administrator.")
-    except Exception as e:
-        st.error(f"Database error: {str(e)}")
+        # Check if OpenAI API key is set
+        if not st.session_state.get("openai_api_key") and not os.getenv("OPENAI_API_KEY"):
+            st.error("OpenAI API key is not set. Please set it in your environment or settings.")
+        
+        # Debug button to check database
+        if st.button("Debug: Check Document Database"):
+            conn = sqlite3.connect(DB_PATH, timeout=20.0)
+            c = conn.cursor()
+            
+            c.execute("SELECT COUNT(*) FROM documents")
+            doc_count = c.fetchone()[0]
+            
+            c.execute("SELECT COUNT(*) FROM chunks")
+            chunk_count = c.fetchone()[0]
+            
+            st.info(f"Documents in database: {doc_count}, Chunks in database: {chunk_count}")
+            
+            if doc_count > 0 and chunk_count == 0:
+                st.error("Documents exist but no chunks were created. Check the document processing logic.")
+            elif doc_count == 0:
+                st.error("No documents in the database. Try uploading some documents first.")
+            
+            conn.close()
         
     # Search interface
     query = st.text_input("Ask a clinical question", placeholder="e.g., What is the recommended monitoring plan for amiodarone?")
+    
+    # Recent searches suggestions
+    if "user_history" in st.session_state and st.session_state["user_history"]:
+        recent_searches = [h["query"] for h in st.session_state["user_history"][-3:]]
+        if recent_searches:
+            st.caption("Recent searches:")
+            cols = st.columns(len(recent_searches))
+            for i, col in enumerate(cols):
+                with col:
+                    if st.button(recent_searches[i], key=f"recent_{i}"):
+                        query = recent_searches[i]
+                        st.session_state["current_query"] = query
+                        st.rerun()
+    
+    # Check for a query from session state
+    if "current_query" in st.session_state:
+        query = st.session_state["current_query"]
+        del st.session_state["current_query"]
     
     # Submit button
     search_col, clear_col = st.columns([5, 1])
@@ -395,22 +874,53 @@ def main_page():
     # Process search
     if search_clicked and query:
         with st.spinner("Searching documents and generating answer..."):
-            # This would normally call your search and answer generation functions
-            # For now, just display a placeholder response
-            st.success("Answer based on the provided documents:")
-            st.markdown("""
-            ## Example Answer
+            # Get model settings from sidebar
+            llm_model = st.session_state.get("llm_model", "gpt-3.5-turbo")
+            include_explanation = st.session_state.get("include_explanation", True)
+            temperature = st.session_state.get("temperature", 0.2)
             
-            This is a placeholder answer since the full search functionality is not implemented in this simplified version.
+            # Generate answer
+            result = generate_answer(
+                query, 
+                model=llm_model, 
+                include_explanation=include_explanation,
+                temp=temperature
+            )
+        
+        # Display answer
+        if result:
+            if result["source_type"] == "Retrieved Documents":
+                st.success("Answer based on the provided documents:")
+            elif result["source_type"] == "No Relevant Documents":
+                st.warning("No matching information found in the documents.")
+            else:
+                st.error("Error generating answer.")
+                
+            st.markdown(result["answer"])
             
-            In a fully functional system, this would show:
+            # Add feedback UI for this answer
+            feedback_ui(result["question_id"])
             
-            1. The answer to your query based on the documents
-            2. Relevant sources and citations
-            3. A feedback mechanism to rate the answer
-            
-            To implement the complete functionality, you'll need to add the search, embedding, and answer generation modules.
-            """)
+            # Display sources if available
+            if result["sources"]:
+                with st.expander("📄 Sources Used", expanded=True):
+                    for idx, doc in enumerate(result["sources"]):
+                        score = doc.get("score", 0)
+                        score_percent = int(score * 100) if score <= 1 else int(score)
+                        
+                        st.markdown(f"**Source {idx+1}: {doc['source']} (Relevance: {score_percent}%)**")
+                        
+                        # Display a snippet of the text
+                        text_snippet = doc["text"]
+                        if len(text_snippet) > 300:
+                            text_snippet = text_snippet[:300] + "..."
+                        
+                        st.markdown(f"""
+                        <div style="padding: 10px; border: 1px solid #f0f0f0; border-radius: 5px; 
+                                  margin-bottom: 10px; background-color: #fafafa;">
+                            {text_snippet}
+                        </div>
+                        """, unsafe_allow_html=True)
 
 def profile_page():
     """Render the user profile page"""
@@ -1047,18 +1557,26 @@ def admin_docs_page():
                             )
                         )
                         
-                        # Store chunks
+                        # Store chunks and generate embeddings
+                        success_count = 0
                         for i, chunk_text in enumerate(chunks):
                             if not chunk_text.strip():
                                 continue
                                 
                             chunk_id = f"{doc_id}_{i+1}"
                             
-                            # For now, we're not generating embeddings
-                            c.execute(
-                                "INSERT INTO chunks VALUES (?, ?, ?, ?)",
-                                (chunk_id, doc_id, chunk_text, None)
-                            )
+                            try:
+                                # Generate embedding
+                                embedding = get_embedding(chunk_text)
+                                embedding_bytes = pickle.dumps(embedding)
+                                
+                                c.execute(
+                                    "INSERT INTO chunks VALUES (?, ?, ?, ?)",
+                                    (chunk_id, doc_id, chunk_text, embedding_bytes)
+                                )
+                                success_count += 1
+                            except Exception as e:
+                                st.warning(f"Error processing chunk {i+1}: {str(e)}")
                         
                         conn.commit()
                         conn.close()
@@ -1066,20 +1584,24 @@ def admin_docs_page():
                         log_action(
                             st.session_state["username"],
                             "upload_document",
-                            f"Uploaded document: {file.name}, ID: {doc_id}, Chunks: {len(chunks)}"
+                            f"Uploaded document: {file.name}, ID: {doc_id}, Chunks: {success_count}"
                         )
                         
-                        st.success(f"✅ {file.name}: Processed successfully with {len(chunks)} chunks")
+                        st.success(f"✅ {file.name}: Processed successfully with {success_count} chunks")
                     except Exception as e:
                         st.error(f"❌ {file.name}: Error processing document: {str(e)}")
                         
                 progress_bar.progress(1.0)
                 status_text.text("Processing complete")
                 
-                # Rebuild index placeholder
+                # Rebuild index
                 with st.spinner("Rebuilding search index..."):
-                    st.info("Search index rebuilding would happen here in the full implementation")
-                    
+                    success, count = rebuild_index_from_db()
+                    if success:
+                        st.success(f"Search index rebuilt with {count} document chunks")
+                    else:
+                        st.error("Failed to rebuild search index")
+    
     # Tab 3: Rebuild Index
     with tab3:
         st.subheader("Rebuild Search Index")
@@ -1088,20 +1610,17 @@ def admin_docs_page():
         This is useful if documents were added, modified, or removed directly in the database.
         """)
         
-        if st.button("Rebuild Index", type="primary"):
-            with st.spinner("Rebuilding search index..."):
-                try:
-                    # Just count chunks for now
-                    conn = sqlite3.connect(DB_PATH, timeout=20.0)
-                    c = conn.cursor()
-                    c.execute("SELECT COUNT(*) FROM chunks")
-                    count = c.fetchone()[0]
-                    conn.close()
-                    
-                    st.success(f"Search index would be rebuilt with {count} document chunks")
-                    st.info("In the full implementation, this would generate embeddings and build a vector index")
-                except Exception as e:
-                    st.error(f"Error accessing database: {str(e)}")
+        # Check if OpenAI API key is set
+        if not st.session_state.get("openai_api_key") and not os.getenv("OPENAI_API_KEY"):
+            st.error("OpenAI API key is required for rebuilding the index. Please set it in your environment or settings.")
+        else:
+            if st.button("Rebuild Index", type="primary"):
+                with st.spinner("Rebuilding search index..."):
+                    success, count = rebuild_index_from_db()
+                    if success:
+                        st.success(f"Search index rebuilt successfully with {count} document chunks")
+                    else:
+                        st.error("Failed to rebuild search index")
 
 def admin_users_page():
     """Admin user management page"""
