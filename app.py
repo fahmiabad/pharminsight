@@ -36,7 +36,20 @@ K_RETRIEVE = 5
 def get_openai_client():
     """Get an OpenAI client with proper error handling"""
     try:
-        api_key = st.session_state.get("openai_api_key") or os.getenv("OPENAI_API_KEY")
+        # Try to get from session state first
+        api_key = st.session_state.get("openai_api_key")
+        
+        # If not in session state, try environment variable
+        if not api_key:
+            api_key = os.getenv("OPENAI_API_KEY")
+        
+        # If not in environment, try Streamlit secrets
+        if not api_key:
+            try:
+                api_key = st.secrets["OPENAI_API_KEY"]
+            except:
+                pass
+        
         if not api_key:
             st.error("❌ OPENAI_API_KEY is missing. Please add it in your environment or settings.")
             st.stop()
@@ -656,8 +669,14 @@ def initialize_session_state():
         
     if "user_history" not in st.session_state:
         st.session_state["user_history"] = []
+    
+    # Try to get OpenAI API key from secrets first, then environment
     if "openai_api_key" not in st.session_state:
-        st.session_state["openai_api_key"] = os.getenv("OPENAI_API_KEY", "")
+        try:
+            st.session_state["openai_api_key"] = st.secrets["OPENAI_API_KEY"]
+        except:
+            st.session_state["openai_api_key"] = os.getenv("OPENAI_API_KEY", "")
+    
     if "embedding_model" not in st.session_state:
         st.session_state["embedding_model"] = "text-embedding-3-small"
     if "show_feedback_form" not in st.session_state:
