@@ -1228,6 +1228,14 @@ def admin_docs_page():
         # Get all documents
         try:
             conn = sqlite3.connect(DB_PATH, timeout=20.0)
+            
+            # First check if documents table has any records
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM documents")
+            total_docs = c.fetchone()[0]
+            st.info(f"Total documents in database: {total_docs}")
+            
+            # Then get the documents with user information
             docs_df = pd.read_sql_query(
                 """
                 SELECT d.doc_id, d.filename, d.category, d.upload_date, d.is_active,
@@ -1240,10 +1248,46 @@ def admin_docs_page():
                 """,
                 conn
             )
+            
+            # Check for documents without users
+            c.execute("""
+                SELECT COUNT(*) 
+                FROM documents d 
+                LEFT JOIN users u ON d.uploader = u.username 
+                WHERE u.username IS NULL
+            """)
+            orphaned_docs = c.fetchone()[0]
+            if orphaned_docs > 0:
+                st.warning(f"Found {orphaned_docs} documents without valid users")
+            
             conn.close()
             
             if docs_df.empty:
                 st.info("No documents in the system yet.")
+                
+                # Add debug button
+                if st.button("Debug: Check Database"):
+                    conn = sqlite3.connect(DB_PATH, timeout=20.0)
+                    c = conn.cursor()
+                    
+                    # Check all documents
+                    c.execute("SELECT doc_id, filename, uploader FROM documents")
+                    all_docs = c.fetchall()
+                    st.write("All documents in database:")
+                    for doc in all_docs:
+                        st.write(f"- {doc[1]} (ID: {doc[0]}, Uploader: {doc[2]})")
+                    
+                    # Check chunks
+                    c.execute("SELECT COUNT(*) FROM chunks")
+                    chunk_count = c.fetchone()[0]
+                    st.write(f"Total chunks in database: {chunk_count}")
+                    
+                    # Check users
+                    c.execute("SELECT username FROM users")
+                    users = [row[0] for row in c.fetchall()]
+                    st.write(f"Users in database: {users}")
+                    
+                    conn.close()
             else:
                 # Format the status column
                 docs_df['status'] = docs_df['is_active'].apply(lambda x: "✅ Active" if x else "❌ Inactive")
@@ -1487,11 +1531,24 @@ def admin_docs_page():
                                 from io import BytesIO
                                 from PyPDF2 import PdfReader
                                 
+                                # Reset file pointer
+                                file.seek(0)
                                 reader = PdfReader(file)
                                 text = ""
-                                for page in reader.pages:
-                                    text += page.extract_text() + "\n\n"
+                                
+                                # Extract text from each page
+                                for page_num, page in enumerate(reader.pages):
+                                    page_text = page.extract_text()
+                                    if page_text:
+                                        text += page_text + "\n\n"
+                                
+                                # Reset file pointer again
                                 file.seek(0)
+                                
+                                # Debug: Show extracted text length
+                                if debug_mode:
+                                    st.write(f"Extracted text length: {len(text)} characters")
+                                
                             except Exception as e:
                                 st.error(f"Error extracting PDF: {str(e)}")
                                 continue
@@ -1560,53 +1617,87 @@ def admin_docs_page():
                         conn = sqlite3.connect(DB_PATH, timeout=20.0)
                         c = conn.cursor()
                         
-                        # Create document record
-                        doc_id = str(uuid.uuid4())
-                        c.execute(
-                            "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                            (
-                                doc_id,
-                                file.name,
-                                datetime.datetime.now().isoformat(),
-                                st.session_state["username"],
-                                metadata.get("category", "Uncategorized"),
-                                metadata.get("description", ""),
-                                metadata.get("expiry_date", ""),
-                                1  # is_active
-                            )
-                        )
-                        
-                        # Store chunks and generate embeddings
-                        success_count = 0
-                        for i, chunk_text in enumerate(chunks):
-                            if not chunk_text.strip():
-                                continue
-                                
-                            chunk_id = f"{doc_id}_{i+1}"
+                        try:
+                            # Start a transaction
+                            conn.execute("BEGIN TRANSACTION")
                             
-                            try:
-                                # Generate embedding
-                                embedding = get_embedding(chunk_text)
-                                embedding_bytes = pickle.dumps(embedding)
-                                
-                                c.execute(
-                                    "INSERT INTO chunks VALUES (?, ?, ?, ?)",
-                                    (chunk_id, doc_id, chunk_text, embedding_bytes)
+                            # Create document record
+                            doc_id = str(uuid.uuid4())
+                            c.execute(
+                                "INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                (
+                                    doc_id,
+                                    file.name,
+                                    datetime.datetime.now().isoformat(),
+                                    st.session_state["username"],
+                                    metadata.get("category", "Uncategorized"),
+                                    metadata.get("description", ""),
+                                    metadata.get("expiry_date", ""),
+                                    1  # is_active
                                 )
-                                success_count += 1
-                            except Exception as e:
-                                st.warning(f"Error processing chunk {i+1}: {str(e)}")
-                        
-                        conn.commit()
-                        conn.close()
-                        
-                        log_action(
-                            st.session_state["username"],
-                            "upload_document",
-                            f"Uploaded document: {file.name}, ID: {doc_id}, Chunks: {success_count}"
-                        )
-                        
-                        st.success(f"✅ {file.name}: Processed successfully with {success_count} chunks")
+                            )
+                            
+                            # Verify document insertion
+                            c.execute("SELECT COUNT(*) FROM documents WHERE doc_id = ?", (doc_id,))
+                            doc_count = c.fetchone()[0]
+                            if doc_count == 0:
+                                raise Exception("Failed to insert document record")
+                            
+                            # Store chunks and generate embeddings
+                            success_count = 0
+                            for i, chunk_text in enumerate(chunks):
+                                if not chunk_text.strip():
+                                    continue
+                                    
+                                chunk_id = f"{doc_id}_{i+1}"
+                                
+                                try:
+                                    # Generate embedding
+                                    status_text.text(f"Processing chunk {i+1}/{len(chunks)}")
+                                    chunk_progress = ((i + 1) / len(chunks)) * 0.5 + 0.5
+                                    progress_bar.progress(chunk_progress)
+                                    
+                                    embedding = get_embedding(chunk_text)
+                                    embedding_bytes = pickle.dumps(embedding)
+                                    
+                                    c.execute(
+                                        "INSERT INTO chunks VALUES (?, ?, ?, ?)",
+                                        (chunk_id, doc_id, chunk_text, embedding_bytes)
+                                    )
+                                    success_count += 1
+                                except Exception as e:
+                                    st.warning(f"Error processing chunk {i+1}: {str(e)}")
+                                    # Continue with other chunks, don't fail entirely
+                            
+                            if success_count == 0:
+                                raise Exception("No chunks were successfully processed")
+                            
+                            # Commit the transaction
+                            conn.commit()
+                            
+                            # Verify the document was actually saved
+                            c.execute("SELECT COUNT(*) FROM documents WHERE doc_id = ?", (doc_id,))
+                            if c.fetchone()[0] == 0:
+                                raise Exception("Document not found after commit")
+                            
+                            # Verify chunks were saved
+                            c.execute("SELECT COUNT(*) FROM chunks WHERE doc_id = ?", (doc_id,))
+                            chunk_count = c.fetchone()[0]
+                            
+                            log_action(
+                                st.session_state["username"],
+                                "upload_document",
+                                f"Uploaded document: {file.name}, ID: {doc_id}, Chunks: {chunk_count}"
+                            )
+                            
+                            st.success(f"✅ {file.name}: Processed successfully with {chunk_count} chunks")
+                            
+                        except Exception as e:
+                            # Rollback the transaction on error
+                            conn.rollback()
+                            st.error(f"❌ {file.name}: Error saving to database: {str(e)}")
+                        finally:
+                            conn.close()
                     except Exception as e:
                         st.error(f"❌ {file.name}: Error processing document: {str(e)}")
                         
